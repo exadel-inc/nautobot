@@ -2496,6 +2496,64 @@ class TestIPAddress(ModelTestCases.BaseModelTestCase):
         ip.validated_save()
         self.assertTrue(IPAddress.objects.filter(host="10.0.0.75").exists())
 
+    def test_dns_name_rejects_invalid_hostnames(self):
+        """RFC 952/1123 label rules must be enforced, not just character membership."""
+        invalid_names = [
+            "whatever-.your.tld",  # label ending in hyphen - previously incorrectly accepted
+            "-host.example.com",  # label starting with hyphen
+            "host-",  # label ending with hyphen
+            "a..b",  # empty label (double dot)
+            ".host",  # empty label (leading dot)
+            ".",  # lone dot
+            "host_name",  # underscore anywhere is now rejected
+            "_sip._tcp.example.com",  # underscore anywhere is now rejected
+            "a" * 64,  # label over 63 chars
+            ".".join(["a" * 50] * 5),  # name over 253 chars
+            "host name",  # space is not allowed
+        ]
+        for name in invalid_names:
+            with self.subTest(name=name):
+                ip = IPAddress(
+                    address="192.0.2.1/24",
+                    status=self.status,
+                    namespace=self.namespace,
+                    dns_name=name,
+                )
+                with self.assertRaises(ValidationError) as cm:
+                    ip.full_clean()
+                self.assertIn("dns_name", cm.exception.message_dict)
+
+    def test_dns_name_accepts_valid_hostnames(self):
+        valid_names = [
+            "whatever.your.tld",
+            "router1",
+            "my-host.example.com",
+            "host.example.com.",  # one optional trailing root dot
+            "1.2.3.example",
+            "a" * 63,  # max label length
+            ".".join(["a" * 63, "a" * 63, "a" * 63, "a" * 61]),  # max total length (253 chars)
+            "",  # blank remains allowed
+        ]
+        for name in valid_names:
+            with self.subTest(name=name):
+                ip = IPAddress(
+                    address="192.0.2.1/24",
+                    status=self.status,
+                    namespace=self.namespace,
+                    dns_name=name,
+                )
+                ip.full_clean()
+
+    def test_dns_name_is_lowercased_on_save(self):
+        ip = IPAddress.objects.create(
+            address="192.0.2.1/24",
+            status=self.status,
+            namespace=self.namespace,
+            dns_name="UPPER.Example.COM",
+        )
+        ip.refresh_from_db()
+        self.assertEqual(ip.dns_name, "upper.example.com")
+
 
 class TestIPAddressRange(ModelTestCases.BaseModelTestCase):
     model = IPAddressRange

@@ -1598,6 +1598,25 @@ class IPAddressTest(APIViewTestCases.APIViewTestCase):
             self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
             self.assertIn("address", response.data)
 
+    def test_create_invalid_dns_name(self):
+        """Pass various invalid dns_name inputs and confirm they are rejected cleanly."""
+        self.add_permissions("ipam.add_ipaddress")
+
+        for bad_dns_name in ("whatever-.your.tld", "-host.example.com", "host_name", "a..b", "."):
+            response = self.client.post(
+                self._get_list_url(),
+                {
+                    "address": "192.168.0.10/32",
+                    "status": self.statuses[0].pk,
+                    "namespace": self.namespace.pk,
+                    "dns_name": bad_dns_name,
+                },
+                format="json",
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+            self.assertIn("dns_name", response.data)
+
     def test_create_multiple_outside_nat_success(self):
         """Validate NAT inside address can tie to multiple NAT outside addresses."""
         # Create the two outside NAT IP Addresses tied back to the single inside NAT address

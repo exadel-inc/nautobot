@@ -1204,6 +1204,19 @@ class IPAddressTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         self.assertBodyContains(response, "Host address cannot be changed once created")
 
     @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_create_object_with_invalid_dns_name_surfaces_form_error(self):
+        """An invalid dns_name must surface as a 200 form re-render with a field error, not a 500."""
+        self.add_permissions("ipam.add_ipaddress")
+        form_data = self.form_data.copy()
+        form_data["dns_name"] = "whatever-.your.tld"
+
+        response = self.client.post(self._get_url("add"), data=post_data(form_data))
+
+        self.assertHttpStatus(response, 200)
+        self.assertBodyContains(response, "cannot begin or end with a hyphen")
+        self.assertFalse(IPAddress.objects.filter(dns_name="whatever-.your.tld").exists())
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
     def test_move_ip_addresses_between_namespaces(self):
         instance = self._get_queryset().first()
         new_namespace = Namespace.objects.create(name="Test Namespace")
@@ -1442,7 +1455,7 @@ class IPAddressMergeTestCase(ModelViewTestCase):
         cls.dup_ip_1 = IPAddress.objects.create(
             parent=parent_1,
             address="94.0.0.2/10",
-            dns_name="example_1",
+            dns_name="example-1",
             status=statuses[0],
             type=IPAddressTypeChoices.TYPE_DHCP,
             role=roles[0],
@@ -1466,7 +1479,7 @@ class IPAddressMergeTestCase(ModelViewTestCase):
         cls.dup_ip_2 = IPAddress.objects.create(
             parent=parent_2,
             address="94.0.0.2/15",
-            dns_name="example_2",
+            dns_name="example-2",
             status=statuses[1],
             type=IPAddressTypeChoices.TYPE_HOST,
             role=roles[1],
@@ -1490,7 +1503,7 @@ class IPAddressMergeTestCase(ModelViewTestCase):
         cls.dup_ip_3 = IPAddress.objects.create(
             parent=parent_3,
             address="94.0.0.2/27",
-            dns_name="example_3",
+            dns_name="example-3",
             status=statuses[2],
             type=IPAddressTypeChoices.TYPE_HOST,
             role=roles[2],
