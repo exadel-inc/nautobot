@@ -27,7 +27,7 @@ DNSValidator = RegexValidator(
     # One or more dot-separated labels, each 1-63 chars of letters/digits/hyphens, not starting or
     # ending with a hyphen, followed by an optional single trailing root dot. The leading lookahead
     # enforces the 253-char limit on the name excluding that optional trailing dot (RFC 952/1123).
-    regex=r"^(?=.{1,253}\.?$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$",
+    regex=r"^(?=.{1,253}\.?\Z)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?\Z",
     message=(
         "This field may only contain letters, digits, and hyphens, with periods separating individual "
         "labels. Each label must be 1-63 characters, cannot begin or end with a hyphen, and the entire "

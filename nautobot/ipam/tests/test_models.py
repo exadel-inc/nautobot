@@ -2510,6 +2510,8 @@ class TestIPAddress(ModelTestCases.BaseModelTestCase):
             "a" * 64,  # label over 63 chars
             ".".join(["a" * 50] * 5),  # name over 253 chars
             "host name",  # space is not allowed
+            "host\n",  # trailing newline must not be accepted via `$` matching before it
+            "host.\n",  # trailing newline after the optional root dot
         ]
         for name in invalid_names:
             with self.subTest(name=name):
