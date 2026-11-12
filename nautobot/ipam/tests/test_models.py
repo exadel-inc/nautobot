@@ -2534,6 +2534,7 @@ class TestIPAddress(ModelTestCases.BaseModelTestCase):
             "1.2.3.example",
             "a" * 63,  # max label length
             ".".join(["a" * 63, "a" * 63, "a" * 63, "a" * 61]),  # max total length (253 chars)
+            "UPPER.Example.COM",  # mixed case is accepted by the validator (lowercased on save)
             "",  # blank remains allowed
         ]
         for name in valid_names:
