@@ -63,6 +63,7 @@ from .models import (
     VLANGroup,
     VRF,
 )
+from .validators import DNSValidator
 
 PREFIX_MASK_LENGTH_CHOICES = add_blank_choice([(i, i) for i in range(PREFIX_LENGTH_MIN, PREFIX_LENGTH_MAX + 1)])
 
@@ -695,7 +696,7 @@ class IPAddressBulkEditForm(
         required=False,
     )
     tenant = DynamicModelChoiceField(queryset=Tenant.objects.all(), required=False)
-    dns_name = forms.CharField(max_length=CHARFIELD_MAX_LENGTH, required=False)
+    dns_name = forms.CharField(max_length=CHARFIELD_MAX_LENGTH, required=False, validators=[DNSValidator])
     description = forms.CharField(max_length=CHARFIELD_MAX_LENGTH, required=False)
     type = forms.ChoiceField(
         required=False,
