@@ -48,7 +48,9 @@ class DNSValidatorTest(TestCase):
         status = Status.objects.get_for_model(IPAddress).first()
         namespace = Namespace.objects.first() or Namespace.objects.create(name="dns-test")
         Prefix.objects.get_or_create(
-            prefix="10.99.0.0/24", namespace=namespace, defaults={"status": Status.objects.get_for_model(Prefix).first()}
+            prefix="10.99.0.0/24",
+            namespace=namespace,
+            defaults={"status": Status.objects.get_for_model(Prefix).first()},
         )
         ip = IPAddress(address="10.99.0.1/24", status=status, namespace=namespace, dns_name="whatever-.your.tld")
         with self.assertRaises(ValidationError) as cm:

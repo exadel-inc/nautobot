@@ -1,5 +1,6 @@
-import nautobot.ipam.validators
 from django.db import migrations, models
+
+import nautobot.ipam.validators
 
 
 class Migration(migrations.Migration):
