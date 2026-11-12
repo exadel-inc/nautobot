@@ -190,6 +190,13 @@ class IPAddressFormTest(NetworkFormTestCases.BaseNetworkFormTest):
         self.assertFalse(form.is_valid())
         self.assertEqual("Only IPv6 addresses can be assigned SLAAC type", form.errors["type"][0])
 
+    def test_invalid_dns_name(self):
+        """Regression test for #8827: a label ending in a hyphen is not a valid hostname."""
+        data = {**self.extra_data, self.field_name: "192.168.0.1/32", "dns_name": "whatever-.your.tld"}
+        form = self.form_class(data=data)
+        self.assertFalse(form.is_valid())
+        self.assertIn("dns_name", form.errors)
+
 
 class IPAddressBulkCreateFormTest(TestCase):
     def test_ipaddress_bulk_create_form_pattern_field(self):

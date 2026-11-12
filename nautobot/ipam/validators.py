@@ -23,8 +23,13 @@ class MinPrefixLengthValidator(BaseValidator):
         return a.prefixlen < b
 
 
+# RFC 952/1123 hostname: dot-separated labels of 1-63 ASCII letters, digits or hyphens (not starting or ending
+# with a hyphen), at most 253 characters excluding one optional trailing dot. Underscores are not allowed.
 DNSValidator = RegexValidator(
-    regex="^[0-9A-Za-z._-]+$",
-    message="Only alphanumeric characters, hyphens, periods, and underscores are allowed in DNS names",
+    regex=r"^(?=.{1,253}\.?\Z)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*\.?\Z",
+    message=(
+        "Enter a valid DNS name: labels of 1-63 letters, digits or hyphens, not starting or ending with a hyphen, "
+        "separated by single periods (253 characters max)."
+    ),
     code="invalid",
 )

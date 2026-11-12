@@ -38,6 +38,7 @@ from nautobot.ipam.models import (
     VRF,
     VRFDeviceAssignment,
 )
+from nautobot.ipam.validators import DNSValidator
 from nautobot.virtualization.models import Cluster, ClusterType, VirtualMachine, VMInterface
 
 
@@ -2125,8 +2126,67 @@ class TestPrefix(ModelTestCases.BaseModelTestCase):
             mock_reparent.assert_not_called()
 
 
+class DNSValidatorTestCase(TestCase):
+    """Tests for the RFC 952/1123 hostname validator."""
+
+    def test_valid(self):
+        for name in (
+            "example",
+            "example.com",
+            "example.com.",
+            "xn--bcher-kva.example",
+            "a-b.c-d",
+            "a",
+            "1.2.3",
+            "a" * 63,
+            ".".join(["a" * 63] * 3 + ["a" * 61]),
+            ".".join(["a" * 63] * 3 + ["a" * 61]) + ".",
+        ):
+            with self.subTest(name=name):
+                DNSValidator(name)
+
+    def test_invalid(self):
+        for name in (
+            "whatever-.your.tld",
+            "-foo.com",
+            "foo-.com",
+            "foo_bar.com",
+            "_srv.example.com",
+            "foo_",
+            "a..b",
+            ".example",
+            ".",
+            "example..",
+            "a" * 64,
+            "a.example." + "a" * 64,
+            ".".join(["a" * 63] * 3 + ["a" * 62]),
+            "exa mple",
+            "exämple",
+            "example.com\n",
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(ValidationError):
+                    DNSValidator(name)
+
+    def test_importable_from_validators_module(self):
+        from nautobot.ipam import validators
+
+        self.assertIs(validators.DNSValidator, DNSValidator)
+
+
 class TestIPAddress(ModelTestCases.BaseModelTestCase):
     model = IPAddress
+
+    def test_dns_name_validation(self):
+        """Regression test for #8827: `whatever-.your.tld` is not a valid hostname."""
+        ip = IPAddress(address="192.0.2.50/24", status=self.status, parent=self.prefix, dns_name="whatever-.your.tld")
+        with self.assertRaises(ValidationError) as cm:
+            ip.full_clean()
+        self.assertIn("dns_name", cm.exception.message_dict)
+
+    def test_dns_name_blank_is_valid(self):
+        ip = IPAddress(address="192.0.2.51/24", status=self.status, parent=self.prefix, dns_name="")
+        ip.full_clean()
 
     def setUp(self):
         super().setUp()
