@@ -2498,16 +2498,13 @@ class TestIPAddress(ModelTestCases.BaseModelTestCase):
         self.assertTrue(IPAddress.objects.filter(host="10.0.0.75").exists())
 
     def test_dns_name_validation(self):
-        """DNS names must follow DNS label structure; underscores and a single trailing dot are allowed."""
+        """DNS names must follow DNS label structure; underscores are rejected and a single trailing dot is allowed."""
         label_63 = "a" * 63
         name_253 = ".".join(["a" * 61] * 4 + ["a" * 5])  # 4 * 62 + 5 = 253
         self.assertEqual(len(name_253), 253)
         valid = [
             "host",
             "host-1.example.com",
-            "example_1",
-            "_srv.example.com",
-            "a_.b",
             "host.example.com.",
             label_63,
             name_253,
@@ -2528,6 +2525,10 @@ class TestIPAddress(ModelTestCases.BaseModelTestCase):
             "host!",
             "host\n",
             "host.example.com.\n",
+            "example_1",
+            "_srv.example.com",
+            "a_.b",
+            "host_name.example",
         ]
         for name in valid:
             with self.subTest(valid=name):

@@ -20,8 +20,8 @@ class Migration(migrations.Migration):
                 validators=[
                     django.core.validators.RegexValidator(
                         code="invalid",
-                        message="DNS names must consist of dot-separated labels of 1-63 alphanumeric, hyphen or underscore characters, not beginning or ending with a hyphen, with a maximum total length of 253 characters.",
-                        regex="^(?=.{1,253}\\.?\\Z)[0-9A-Za-z_](?:[0-9A-Za-z_-]{0,61}[0-9A-Za-z_])?(?:\\.[0-9A-Za-z_](?:[0-9A-Za-z_-]{0,61}[0-9A-Za-z_])?)*\\.?\\Z",
+                        message="DNS names must consist of dot-separated labels of 1-63 alphanumeric or hyphen characters, not beginning or ending with a hyphen, with a maximum total length of 253 characters.",
+                        regex="^(?=.{1,253}\\.?\\Z)[0-9A-Za-z](?:[0-9A-Za-z-]{0,61}[0-9A-Za-z])?(?:\\.[0-9A-Za-z](?:[0-9A-Za-z-]{0,61}[0-9A-Za-z])?)*\\.?\\Z",
                     )
                 ],
             ),
