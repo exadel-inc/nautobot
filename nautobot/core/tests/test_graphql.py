@@ -829,6 +829,34 @@ class GraphQLRelationshipResolverQueryCountTest(GraphQLTestCaseBase):
                 self.assertEqual(small_count, large_count)
                 self.assertGreater(len(next(iter(large_data.values()))), len(next(iter(small_data.values()))))
 
+    def test_single_parent_query_does_not_load_entire_relationship_graph(self):
+        """A single-parent query must not load associations/peers belonging to every other parent (regression).
+
+        `_get_batched_peers` used to fetch every `RelationshipAssociation` for the relationship regardless of how
+        many parents the GraphQL query actually matched, so a request for one parent scaled with the size of the
+        whole relationship graph rather than with its own (small) result set.
+        """
+        self.create_parents(50)  # many unrelated locations/VLANs sharing the same relationship
+        location = Location.objects.get(name="Count Location 001")
+        query = f"""
+        query {{ locations(id: "{location.pk}") {{ name rel_count_location_to_vlans {{ name }} }} }}
+        """
+        with CaptureQueriesContext(connection) as ctx:
+            data = self._run(query)
+        self.assertEqual(len(data["locations"]), 1)
+        self.assertEqual(len(data["locations"][0]["rel_count_location_to_vlans"]), 2)
+
+        association_queries = [
+            q["sql"] for q in ctx.captured_queries if "relationshipassociation" in q["sql"].lower()
+        ]
+        self.assertTrue(association_queries, "Expected a query against RelationshipAssociation")
+        pk_variants = (str(location.pk), location.pk.hex)
+        self.assertTrue(
+            any(variant in sql for sql in association_queries for variant in pk_variants),
+            "Association lookup must be scoped to the queried parent, not the entire relationship graph: "
+            f"{association_queries}",
+        )
+
     def test_results(self):
         """Peers, ordering, single-vs-list and symmetric directions are as expected."""
         location = Location.objects.get(name="Count Location 001")

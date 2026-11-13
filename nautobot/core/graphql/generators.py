@@ -3,6 +3,7 @@
 import logging
 
 from django.core.exceptions import ObjectDoesNotExist
+from django.db.models import Q
 import graphene
 import graphene_django_optimizer as gql_optimizer
 from graphql import GraphQLError
@@ -242,6 +243,20 @@ def _in_list_context(info):
     return any(isinstance(key, int) for key in info.path.as_list())
 
 
+def _list_parent_pks(info):
+    """Return the pks of the list currently being resolved, as recorded by `generate_list_resolver`, or None.
+
+    `None` means the enclosing list isn't one `generate_list_resolver` populated (e.g. a deeper nesting level),
+    so callers should fall back to an unrestricted lookup.
+    """
+    cache = getattr(info.context, "_gql_list_pks", None)
+    if not cache:
+        return None
+    # Path of the current (relationship) field is [..., <list field>, <index>, <this field>]; the list field's
+    # own path (which is what generate_list_resolver keyed its cache entry with) drops the last two segments.
+    return cache.get(tuple(info.path.as_list()[:-2]))
+
+
 def _optimized_or_plain(queryset, info):
     """Apply the GraphQL optimizer to `queryset`, falling back to the un-optimized queryset if it fails."""
     # https://github.com/nautobot/nautobot/issues/1228
@@ -267,9 +282,16 @@ def _get_batched_peers(info, relationship, side, peer_model):
     if cache_key not in info.context._gql_relationship_cache:
         peer_side = RelationshipSideChoices.OPPOSITE[side]
         parent_ids_by_peer = {}
-        associations = RelationshipAssociation.objects.filter(relationship=relationship).values_list(
-            "source_id", "destination_id"
-        )
+        associations = RelationshipAssociation.objects.filter(relationship=relationship)
+        # Scope to the parents actually being resolved, so a filtered/paginated list (e.g. `locations(id: "...")`)
+        # doesn't pull in associations and peers belonging to every other parent sharing this relationship.
+        parent_pks = _list_parent_pks(info)
+        if parent_pks is not None:
+            if relationship.symmetric:
+                associations = associations.filter(Q(source_id__in=parent_pks) | Q(destination_id__in=parent_pks))
+            else:
+                associations = associations.filter(**{f"{side}_id__in": parent_pks})
+        associations = associations.values_list("source_id", "destination_id")
         for source_id, destination_id in associations:
             if relationship.symmetric:
                 parent_ids_by_peer.setdefault(destination_id, set()).add(source_id)
@@ -485,7 +507,13 @@ def generate_list_resolver(schema_type, resolver_name):
         if limit:
             qs = qs[:limit]
 
-        return gql_optimizer.query(qs, info)
+        objects = list(gql_optimizer.query(qs, info))
+        # Record which parents this list actually resolved, so nested relationship resolvers (see
+        # `_list_parent_pks`) can scope their batched lookups instead of loading the entire relationship.
+        if not hasattr(info.context, "_gql_list_pks"):
+            info.context._gql_list_pks = {}
+        info.context._gql_list_pks[tuple(info.path.as_list())] = {obj.pk for obj in objects}
+        return objects
 
     list_resolver.__name__ = resolver_name
     return list_resolver
