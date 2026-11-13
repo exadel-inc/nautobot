@@ -14,8 +14,8 @@ from django.core.cache import cache
 from django.db import connection
 from django.db.models import Count, Q
 from django.test import override_settings, tag
-from django.test.utils import CaptureQueriesContext
 from django.test.client import RequestFactory
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 import graphene.types
 from graphene_django.registry import get_global_registry
@@ -783,15 +783,13 @@ class GraphQLRelationshipResolverQueryCountTest(GraphQLTestCaseBase):
             )
             rack = Rack.objects.create(name=f"Count Rack {n:03}", location=location, status=cls.rack_status)
             vlans = [
-                VLAN.objects.create(name=f"Count VLAN {n:03}-{i}", vid=2000 + n * 2 + i, status=cls.vlan_status)
+                VLAN.objects.create(name=f"Count VLAN {n:03}-{i}", vid=2000 + n * 2 - i, status=cls.vlan_status)
                 for i in range(2)
             ]
             for vlan in vlans:
                 RelationshipAssociation.objects.create(relationship=cls.m2m, source=location, destination=vlan)
             RelationshipAssociation.objects.create(relationship=cls.o2m, source=location, destination=rack)
-            RelationshipAssociation.objects.create(
-                relationship=cls.symmetric, source=vlans[0], destination=vlans[1]
-            )
+            RelationshipAssociation.objects.create(relationship=cls.symmetric, source=vlans[0], destination=vlans[1])
 
     def setUp(self):
         super().setUp()
@@ -829,7 +827,7 @@ class GraphQLRelationshipResolverQueryCountTest(GraphQLTestCaseBase):
                 self.create_parents(2)
                 large_count, large_data = self._count_queries(query)
                 self.assertEqual(small_count, large_count)
-                self.assertGreater(len(list(large_data.values())[0]), len(list(small_data.values())[0]))
+                self.assertGreater(len(next(iter(large_data.values()))), len(next(iter(small_data.values()))))
 
     def test_results(self):
         """Peers, ordering, single-vs-list and symmetric directions are as expected."""
@@ -847,11 +845,10 @@ class GraphQLRelationshipResolverQueryCountTest(GraphQLTestCaseBase):
         by_name = {loc["name"]: loc for loc in data["locations"]}
         self.assertEqual(
             [v["name"] for v in by_name[location.name]["rel_count_location_to_vlans"]],
-            ["Count VLAN 001-0", "Count VLAN 001-1"],
+            # VLAN default ordering (vid), not creation/association order (the first-created VLAN has the higher vid)
+            ["Count VLAN 001-1", "Count VLAN 001-0"],
         )
-        self.assertEqual(
-            [r["name"] for r in by_name[location.name]["rel_count_location_to_racks"]], ["Count Rack 001"]
-        )
+        self.assertEqual([r["name"] for r in by_name[location.name]["rel_count_location_to_racks"]], ["Count Rack 001"])
         self.assertEqual(by_name[lone_location.name]["rel_count_location_to_vlans"], [])
         self.assertEqual(by_name[lone_location.name]["rel_count_location_to_racks"], [])
 
@@ -870,6 +867,23 @@ class GraphQLRelationshipResolverQueryCountTest(GraphQLTestCaseBase):
         peers = {v["name"]: [p["name"] for p in v["rel_count_vlan_peers"]] for v in data["vlans"]}
         self.assertEqual(peers, {"Count VLAN 001-0": ["Count VLAN 001-1"], "Count VLAN 001-1": ["Count VLAN 001-0"]})
 
+    def test_same_field_with_different_selections(self):
+        """The same relationship field selected twice with different sub-selections gets each selection's fields."""
+        query = """
+        query { locations(name__isw: "Count Location") {
+            a: rel_count_location_to_vlans { name }
+            b: rel_count_location_to_vlans { vid description }
+        } }
+        """
+        self._run(query)  # warm up caches
+        small_count, _ = self._count_queries(query)
+        self.create_parents(2)
+        large_count, data = self._count_queries(query)
+        self.assertEqual(small_count, large_count)
+        for location in data["locations"]:
+            self.assertEqual(len(location["a"]), len(location["b"]))
+            self.assertTrue(all("vid" in vlan for vlan in location["b"]))
+
     def test_single_object_queries(self):
         """Single-object queries, including id-only selections (#1228), still work."""
         location = Location.objects.get(name="Count Location 001")
@@ -879,9 +893,7 @@ class GraphQLRelationshipResolverQueryCountTest(GraphQLTestCaseBase):
         )
         self.assertEqual(len(data["location"]["rel_count_location_to_vlans"]), 2)
         self.assertIsNotNone(data["location"]["rel_count_location_to_racks"])
-        data = self._run(
-            f'query {{ locations(id: "{location.pk}") {{ rel_count_location_to_vlans {{ id }} }} }}'
-        )
+        data = self._run(f'query {{ locations(id: "{location.pk}") {{ rel_count_location_to_vlans {{ id }} }} }}')
         self.assertEqual(len(data["locations"][0]["rel_count_location_to_vlans"]), 2)
 
 

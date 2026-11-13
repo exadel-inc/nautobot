@@ -262,7 +262,8 @@ def _get_batched_peers(info, relationship, side, peer_model):
     """
     if not hasattr(info.context, "_gql_relationship_cache"):
         info.context._gql_relationship_cache = {}
-    cache_key = (relationship.pk, side)
+    # The peer queryset is optimized for this field's sub-selection, so the cache must be per selection too.
+    cache_key = (relationship.pk, side, tuple(id(node) for node in info.field_nodes))
     if cache_key not in info.context._gql_relationship_cache:
         peer_side = RelationshipSideChoices.OPPOSITE[side]
         parent_ids_by_peer = {}
