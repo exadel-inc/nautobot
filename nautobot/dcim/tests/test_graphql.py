@@ -24,6 +24,7 @@ from nautobot.dcim.models import (
     FrontPortTemplate,
     Interface,
     InterfaceTemplate,
+    InventoryItem,
     Location,
     LocationType,
     Manufacturer,
@@ -501,3 +502,25 @@ class GraphQLFKPermissionTest(GraphQLTestCase):
         denied_result = execute_query(query, user=self.user, variables={"id": str(self.denied_status.pk)})
         self.assertIsNone(denied_result.errors)
         self.assertIsNone(denied_result.data["status"])
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_inventory_items_location_filter_includes_descendants(self):
+        parent_type = LocationType.objects.create(name="GraphQL Parent Type")
+        parent_type.content_types.add(ContentType.objects.get_for_model(Device))
+        child_type = LocationType.objects.create(name="GraphQL Child Type", parent=parent_type)
+        child_type.content_types.add(ContentType.objects.get_for_model(Device))
+        status = Status.objects.get_for_model(Location).first()
+        parent = Location.objects.create(name="GraphQL Parent", location_type=parent_type, status=status)
+        child = Location.objects.create(name="GraphQL Child", location_type=child_type, parent=parent, status=status)
+        device = Device.objects.create(
+            location=child,
+            role=self.device_role,
+            device_type=self.device_type,
+            name="GraphQL Child Device",
+            status=Status.objects.get_for_model(Device).first(),
+        )
+        InventoryItem.objects.create(device=device, name="GraphQL Child Item")
+
+        resp = execute_query('query { inventory_items(location: "GraphQL Parent") { name } }', user=self.user)
+        self.assertIsNone(resp.errors)
+        self.assertEqual([item["name"] for item in resp.data["inventory_items"]], ["GraphQL Child Item"])

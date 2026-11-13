@@ -6,7 +6,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.db.models import F, Q
 
 from nautobot.circuits.models import Circuit, CircuitTermination, CircuitType, Provider
-from nautobot.core.testing import FilterTestCases
+from nautobot.core.testing import FilterTestCases, TestCase
 from nautobot.dcim.choices import (
     CableLengthUnitChoices,
     CableTypeChoices,
@@ -5037,3 +5037,175 @@ class InterfaceConnectionFilterSetTestCase(_ConnectionFilterSetTestMixin, Filter
         unfiltered_count = self.queryset.count()
         result = self.filterset({"location": "   "}, self.queryset).qs
         self.assertEqual(result.count(), unfiltered_count)
+
+
+class DeviceScopedLocationHierarchyTestCase(TestCase):
+    """`location` filters on device-scoped objects match the given location and its descendants."""
+
+    @classmethod
+    def setUpTestData(cls):
+        device_ct = ContentType.objects.get_for_model(Device)
+        parent_type = LocationType.objects.create(name="Hierarchy Parent Type")
+        parent_type.content_types.add(device_ct)
+        child_type = LocationType.objects.create(name="Hierarchy Child Type", parent=parent_type)
+        child_type.content_types.add(device_ct)
+        active = Status.objects.get_for_model(Location).first()
+        cls.parent = Location.objects.create(name="Hierarchy Parent", location_type=parent_type, status=active)
+        cls.child = Location.objects.create(
+            name="Hierarchy Child", location_type=child_type, parent=cls.parent, status=active
+        )
+        cls.other = Location.objects.create(name="Hierarchy Other", location_type=parent_type, status=active)
+
+        device_type = DeviceType.objects.create(
+            manufacturer=Manufacturer.objects.first(), model="Hierarchy DT", subdevice_role="parent"
+        )
+        role = Role.objects.get_for_model(Device).first()
+        device_status = Status.objects.get_for_model(Device).first()
+        cls.devices = {}
+        for key, location in (("parent", cls.parent), ("child", cls.child), ("other", cls.other)):
+            cls.devices[key] = Device.objects.create(
+                name=f"Hierarchy {key}",
+                device_type=device_type,
+                role=role,
+                location=location,
+                status=device_status,
+            )
+        iface_status = Status.objects.get_for_model(Interface).first()
+        cls.items = {}
+        cls.components = {key: {} for key in cls.devices}
+        for key, device in cls.devices.items():
+            cls.items[key] = InventoryItem.objects.create(device=device, name=f"Hierarchy item {key}")
+            comps = cls.components[key]
+            comps["interface"] = Interface.objects.create(
+                device=device, name="eth0", status=iface_status, type="1000base-t"
+            )
+            comps["console"] = ConsolePort.objects.create(device=device, name="con")
+            comps["console_server"] = ConsoleServerPort.objects.create(device=device, name="csp")
+            comps["power"] = PowerPort.objects.create(device=device, name="pp")
+            comps["outlet"] = PowerOutlet.objects.create(device=device, name="po")
+            comps["rear"] = RearPort.objects.create(
+                device=device, name="rp", type=PortTypeChoices.TYPE_8P8C, positions=1
+            )
+            comps["front"] = FrontPort.objects.create(
+                device=device,
+                name="fp",
+                type=PortTypeChoices.TYPE_8P8C,
+                rear_port=comps["rear"],
+                rear_port_position=1,
+            )
+            comps["bay"] = DeviceBay.objects.create(device=device, name="bay")
+        cls.chassis = {}
+        for key, device in cls.devices.items():
+            chassis = VirtualChassis.objects.create(name=f"Hierarchy VC {key}", master=device)
+            device.virtual_chassis = chassis
+            device.vc_position = 1
+            device.save()
+            cls.chassis[key] = chassis
+
+    def _assert_filter(self, filterset_class, queryset, params, expected):
+        filterset = filterset_class(params, queryset)
+        self.assertTrue(filterset.is_valid(), filterset.errors)
+        self.assertQuerySetEqual(filterset.qs, [obj.pk for obj in expected], transform=lambda o: o.pk, ordered=False)
+
+    def test_inventory_item_location_includes_descendants(self):
+        expected = [self.items["parent"], self.items["child"]]
+        for label, value in (("name", self.parent.name), ("pk", str(self.parent.pk))):
+            with self.subTest(label):
+                self._assert_filter(
+                    InventoryItemFilterSet, InventoryItem.objects.all(), {"location": [value]}, expected
+                )
+
+    def test_inventory_item_location_without_children_is_exact(self):
+        self._assert_filter(
+            InventoryItemFilterSet, InventoryItem.objects.all(), {"location": [self.child.name]}, [self.items["child"]]
+        )
+
+    def test_unknown_location_is_invalid(self):
+        filterset = InventoryItemFilterSet({"location": ["No Such Location"]}, InventoryItem.objects.all())
+        self.assertFalse(filterset.is_valid())
+
+    def test_component_location_includes_descendants(self):
+        cases = (
+            ("interface", InterfaceFilterSet, Interface),
+            ("console", ConsolePortFilterSet, ConsolePort),
+            ("console_server", ConsoleServerPortFilterSet, ConsoleServerPort),
+            ("power", PowerPortFilterSet, PowerPort),
+            ("outlet", PowerOutletFilterSet, PowerOutlet),
+            ("front", FrontPortFilterSet, FrontPort),
+            ("rear", RearPortFilterSet, RearPort),
+            ("bay", DeviceBayFilterSet, DeviceBay),
+        )
+        for key, filterset_class, model in cases:
+            with self.subTest(key):
+                self._assert_filter(
+                    filterset_class,
+                    model.objects.all(),
+                    {"location": [self.parent.name]},
+                    [self.components["parent"][key], self.components["child"][key]],
+                )
+                self._assert_filter(
+                    filterset_class,
+                    model.objects.all(),
+                    {"location": [self.child.name]},
+                    [self.components["child"][key]],
+                )
+
+    def test_virtual_chassis_location_includes_descendants(self):
+        self._assert_filter(
+            VirtualChassisFilterSet,
+            VirtualChassis.objects.all(),
+            {"location": [self.parent.name]},
+            [self.chassis["parent"], self.chassis["child"]],
+        )
+        self._assert_filter(
+            VirtualChassisFilterSet,
+            VirtualChassis.objects.all(),
+            {"location": [self.child.pk]},
+            [self.chassis["child"]],
+        )
+
+    def test_connection_filtersets_location_includes_descendants(self):
+        cable_status = Status.objects.get_for_model(Cable).get(name="Connected")
+        iface_status = Status.objects.get_for_model(Interface).first()
+        conns = {}
+        for key, device in self.devices.items():
+            peer_a = ConsolePort.objects.create(device=device, name=f"cc-{key}")
+            Cable.objects.create(
+                termination_a=peer_a,
+                termination_b=ConsoleServerPort.objects.create(device=device, name=f"ccs-{key}"),
+                status=cable_status,
+            )
+            power = PowerPort.objects.create(device=device, name=f"pc-{key}")
+            Cable.objects.create(
+                termination_a=power,
+                termination_b=PowerOutlet.objects.create(device=device, name=f"pco-{key}"),
+                status=cable_status,
+            )
+            ifaces = [
+                Interface.objects.create(device=device, name=f"ic-{key}-{i}", status=iface_status, type="1000base-t")
+                for i in range(2)
+            ]
+            Cable.objects.create(termination_a=ifaces[0], termination_b=ifaces[1], status=cable_status)
+            conns[key] = (peer_a, power, ifaces)
+
+        for filterset_class, model, index in (
+            (ConsoleConnectionFilterSet, ConsolePort, 0),
+            (PowerConnectionFilterSet, PowerPort, 1),
+        ):
+            with self.subTest(filterset_class.__name__):
+                queryset = model.objects.filter(cable_paths__isnull=False)
+                self._assert_filter(
+                    filterset_class,
+                    queryset,
+                    {"location": self.parent.name},
+                    [conns["parent"][index], conns["child"][index]],
+                )
+                self._assert_filter(filterset_class, queryset, {"location": self.child.name}, [conns["child"][index]])
+
+        with self.subTest("InterfaceConnectionFilterSet"):
+            ct = ContentType.objects.get_for_model(Interface)
+            queryset = CablePath.objects.filter(origin_type=ct, destination_type=ct, origin_id__lt=F("destination_id"))
+            for name, keys in ((self.parent.name, ("parent", "child")), (self.child.name, ("child",))):
+                result = InterfaceConnectionFilterSet({"location": name}, queryset).qs.distinct()
+                expected = {iface.pk for key in keys for iface in conns[key][2]}
+                self.assertEqual({cp.origin_id for cp in result} | {cp.destination_id for cp in result}, expected)

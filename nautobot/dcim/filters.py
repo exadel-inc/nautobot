@@ -1344,7 +1344,8 @@ class InventoryItemFilterSet(DeviceComponentModelFilterSetMixin, RelationshipMod
             "description": "icontains",
         },
     )
-    location = NaturalKeyOrPKMultipleChoiceFilter(
+    location = TreeNodeMultipleChoiceFilter(
+        prefers_id=True,
         queryset=Location.objects.all(),
         field_name="device__location",
         to_field_name="name",
@@ -1427,8 +1428,7 @@ class VirtualChassisFilterSet(NautobotFilterSet):
         queryset=Device.objects.all(),
         to_field_name="name",
     )
-    # TODO Check this filter as it is not using TreeNode...
-    location = NaturalKeyOrPKMultipleChoiceFilter(
+    location = TreeNodeMultipleChoiceFilter(
         prefers_id=True,
         field_name="master__location",
         queryset=Location.objects.all(),
@@ -1789,11 +1789,19 @@ class CableFilterSet(NautobotFilterSet, StatusModelFilterSetMixin):
         return queryset.filter(pk__in=cable_ids)
 
 
+def _location_and_descendant_pks(name):
+    """Return the PKs of every Location called `name` plus all of their descendants."""
+    pks = set()
+    for location in Location.objects.filter(name=name):
+        pks.update(location.cacheable_descendants_pks(include_self=True))
+    return pks
+
+
 class ConnectionFilterSetMixin:
     def filter_location(self, queryset, name, value):
         if not value.strip():
             return queryset
-        return queryset.filter(device__location__name=value)
+        return queryset.filter(device__location__in=_location_and_descendant_pks(value))
 
     def filter_device(self, queryset, name, value):
         if not value:
@@ -1872,7 +1880,7 @@ class InterfaceConnectionFilterSet(BaseFilterSet):
     def filter_location(self, queryset, name, value):
         if not value.strip():
             return queryset
-        return self._filter_either_endpoint(queryset, Q(device__location__name=value))
+        return self._filter_either_endpoint(queryset, Q(device__location__in=_location_and_descendant_pks(value)))
 
     def filter_device_id(self, queryset, name, value):
         return self._filter_either_endpoint(queryset, Q(device_id__in=value))

@@ -111,7 +111,8 @@ class DeviceComponentModelFilterSetMixin(CustomFieldModelFilterSetMixin):
             "description": "icontains",
         },
     )
-    location = NaturalKeyOrPKMultipleChoiceFilter(
+    location = TreeNodeMultipleChoiceFilter(
+        prefers_id=True,
         field_name="device__location",
         queryset=Location.objects.all(),
         to_field_name="name",
