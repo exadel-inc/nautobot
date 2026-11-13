@@ -23,8 +23,14 @@ class MinPrefixLengthValidator(BaseValidator):
         return a.prefixlen < b
 
 
+_DNS_LABEL = r"[0-9A-Za-z](?:[0-9A-Za-z-]{0,61}[0-9A-Za-z])?"
+
 DNSValidator = RegexValidator(
-    regex="^[0-9A-Za-z._-]+$",
-    message="Only alphanumeric characters, hyphens, periods, and underscores are allowed in DNS names",
+    # The lookahead caps the total length at 253 characters, not counting one optional trailing dot.
+    regex=rf"^(?=.{{1,253}}\.?\Z){_DNS_LABEL}(?:\.{_DNS_LABEL})*\.?\Z",
+    message=(
+        "DNS names must consist of dot-separated labels of 1-63 alphanumeric or hyphen characters, "
+        "not beginning or ending with a hyphen, with a maximum total length of 253 characters."
+    ),
     code="invalid",
 )
