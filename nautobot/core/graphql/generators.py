@@ -243,6 +243,17 @@ def _in_list_context(info):
     return any(isinstance(key, int) for key in info.path.as_list())
 
 
+def _list_path(info):
+    """Return the path of the list field enclosing the field currently being resolved.
+
+    Path of the current (relationship) field is [..., <list field>, <index>, <this field>]; the list field's
+    own path (which is what `generate_list_resolver` keyed its cache entry with) drops the last two segments.
+    This path is unique per alias, so it also distinguishes two differently-filtered aliases of the same list
+    field (e.g. `locations` and `locations2: locations` in the same query).
+    """
+    return tuple(info.path.as_list()[:-2])
+
+
 def _list_parent_pks(info):
     """Return the pks of the list currently being resolved, as recorded by `generate_list_resolver`, or None.
 
@@ -252,9 +263,7 @@ def _list_parent_pks(info):
     cache = getattr(info.context, "_gql_list_pks", None)
     if not cache:
         return None
-    # Path of the current (relationship) field is [..., <list field>, <index>, <this field>]; the list field's
-    # own path (which is what generate_list_resolver keyed its cache entry with) drops the last two segments.
-    return cache.get(tuple(info.path.as_list()[:-2]))
+    return cache.get(_list_path(info))
 
 
 def _optimized_or_plain(queryset, info):
@@ -278,7 +287,9 @@ def _get_batched_peers(info, relationship, side, peer_model):
     if not hasattr(info.context, "_gql_relationship_cache"):
         info.context._gql_relationship_cache = {}
     # The peer queryset is optimized for this field's sub-selection, so the cache must be per selection too.
-    cache_key = (relationship.pk, side, tuple(id(node) for node in info.field_nodes))
+    # The list path is also included because a fragment shared by two differently-filtered aliases of the same
+    # list field (e.g. `locations` and `locations2: locations`) reuses the same field nodes for both aliases.
+    cache_key = (relationship.pk, side, tuple(id(node) for node in info.field_nodes), _list_path(info))
     if cache_key not in info.context._gql_relationship_cache:
         peer_side = RelationshipSideChoices.OPPOSITE[side]
         parent_ids_by_peer = {}

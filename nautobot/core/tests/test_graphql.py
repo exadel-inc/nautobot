@@ -846,9 +846,7 @@ class GraphQLRelationshipResolverQueryCountTest(GraphQLTestCaseBase):
         self.assertEqual(len(data["locations"]), 1)
         self.assertEqual(len(data["locations"][0]["rel_count_location_to_vlans"]), 2)
 
-        association_queries = [
-            q["sql"] for q in ctx.captured_queries if "relationshipassociation" in q["sql"].lower()
-        ]
+        association_queries = [q["sql"] for q in ctx.captured_queries if "relationshipassociation" in q["sql"].lower()]
         self.assertTrue(association_queries, "Expected a query against RelationshipAssociation")
         pk_variants = (str(location.pk), location.pk.hex)
         self.assertTrue(
@@ -911,6 +909,36 @@ class GraphQLRelationshipResolverQueryCountTest(GraphQLTestCaseBase):
         for location in data["locations"]:
             self.assertEqual(len(location["a"]), len(location["b"]))
             self.assertTrue(all("vid" in vlan for vlan in location["b"]))
+
+    def test_same_fragment_under_two_filtered_aliases(self):
+        """A fragment shared by two differently-filtered aliases of the same list must not cross-contaminate (regression).
+
+        `_get_batched_peers` used to cache its result keyed only by relationship/side/field-nodes; a fragment
+        spread into two aliases of the same list field reuses the same field nodes for both, so the second
+        alias resolved would incorrectly reuse (or be scoped to) the first alias's cached parents.
+        """
+        location_1 = Location.objects.get(name="Count Location 001")
+        location_2 = Location.objects.get(name="Count Location 002")
+        query = f"""
+        fragment VlanFrag on LocationType {{
+            rel_count_location_to_vlans {{ name }}
+        }}
+        query {{
+            a: locations(id: "{location_1.pk}") {{ name ...VlanFrag }}
+            b: locations(id: "{location_2.pk}") {{ name ...VlanFrag }}
+        }}
+        """
+        data = self._run(query)
+        self.assertEqual(len(data["a"]), 1)
+        self.assertEqual(len(data["b"]), 1)
+        self.assertEqual(
+            {v["name"] for v in data["a"][0]["rel_count_location_to_vlans"]},
+            {"Count VLAN 001-0", "Count VLAN 001-1"},
+        )
+        self.assertEqual(
+            {v["name"] for v in data["b"][0]["rel_count_location_to_vlans"]},
+            {"Count VLAN 002-0", "Count VLAN 002-1"},
+        )
 
     def test_single_object_queries(self):
         """Single-object queries, including id-only selections (#1228), still work."""
