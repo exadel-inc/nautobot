@@ -38,6 +38,7 @@ from nautobot.ipam.models import (
     VRF,
     VRFDeviceAssignment,
 )
+from nautobot.ipam.validators import DNSValidator
 from nautobot.virtualization.models import Cluster, ClusterType, VirtualMachine, VMInterface
 
 
@@ -2525,6 +2526,8 @@ class TestIPAddress(ModelTestCases.BaseModelTestCase):
             name_253 + "a",
             "host name",
             "host!",
+            "host\n",
+            "host.example.com.\n",
         ]
         for name in valid:
             with self.subTest(valid=name):
@@ -2536,6 +2539,15 @@ class TestIPAddress(ModelTestCases.BaseModelTestCase):
                 with self.assertRaises(ValidationError) as cm:
                     ip.full_clean()
                 self.assertIn("dns_name", cm.exception.message_dict)
+        for name in valid:
+            with self.subTest(validator_valid=name):
+                DNSValidator(name)
+        for name in invalid:
+            with self.subTest(validator_invalid=name):
+                with self.assertRaises(ValidationError) as cm:
+                    DNSValidator(name)
+                self.assertEqual(cm.exception.code, "invalid")
+                self.assertIn("DNS names must consist of", cm.exception.message)
 
 
 class TestIPAddressRange(ModelTestCases.BaseModelTestCase):

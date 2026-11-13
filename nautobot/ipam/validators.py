@@ -27,7 +27,7 @@ _DNS_LABEL = r"[0-9A-Za-z_](?:[0-9A-Za-z_-]{0,61}[0-9A-Za-z_])?"
 
 DNSValidator = RegexValidator(
     # The lookahead caps the total length at 253 characters, not counting one optional trailing dot.
-    regex=rf"^(?=.{{1,253}}\.?$){_DNS_LABEL}(?:\.{_DNS_LABEL})*\.?$",
+    regex=rf"^(?=.{{1,253}}\.?\Z){_DNS_LABEL}(?:\.{_DNS_LABEL})*\.?\Z",
     message=(
         "DNS names must consist of dot-separated labels of 1-63 alphanumeric, hyphen or underscore characters, "
         "not beginning or ending with a hyphen, with a maximum total length of 253 characters."

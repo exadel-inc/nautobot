@@ -5,15 +5,25 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('ipam', '0058_iprange_role_data'),
+        ("ipam", "0058_iprange_role_data"),
     ]
 
     operations = [
         migrations.AlterField(
-            model_name='ipaddress',
-            name='dns_name',
-            field=models.CharField(blank=True, db_index=True, max_length=255, validators=[django.core.validators.RegexValidator(code='invalid', message='DNS names must consist of dot-separated labels of 1-63 alphanumeric, hyphen or underscore characters, not beginning or ending with a hyphen, with a maximum total length of 253 characters.', regex='^(?=.{1,253}\\.?$)[0-9A-Za-z_](?:[0-9A-Za-z_-]{0,61}[0-9A-Za-z_])?(?:\\.[0-9A-Za-z_](?:[0-9A-Za-z_-]{0,61}[0-9A-Za-z_])?)*\\.?$')]),
+            model_name="ipaddress",
+            name="dns_name",
+            field=models.CharField(
+                blank=True,
+                db_index=True,
+                max_length=255,
+                validators=[
+                    django.core.validators.RegexValidator(
+                        code="invalid",
+                        message="DNS names must consist of dot-separated labels of 1-63 alphanumeric, hyphen or underscore characters, not beginning or ending with a hyphen, with a maximum total length of 253 characters.",
+                        regex="^(?=.{1,253}\\.?\\Z)[0-9A-Za-z_](?:[0-9A-Za-z_-]{0,61}[0-9A-Za-z_])?(?:\\.[0-9A-Za-z_](?:[0-9A-Za-z_-]{0,61}[0-9A-Za-z_])?)*\\.?\\Z",
+                    )
+                ],
+            ),
         ),
     ]
