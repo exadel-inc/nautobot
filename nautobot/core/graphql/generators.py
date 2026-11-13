@@ -237,8 +237,76 @@ def generate_computed_field_resolver(name, resolver_name):
     return resolve_computed_field
 
 
+def _in_list_context(info):
+    """Return True if the parent object is being resolved as an element of a list (e.g. `services[3].rel_x`)."""
+    return any(isinstance(key, int) for key in info.path.as_list())
+
+
+def _optimized_or_plain(queryset, info):
+    """Apply the GraphQL optimizer to `queryset`, falling back to the un-optimized queryset if it fails."""
+    # https://github.com/nautobot/nautobot/issues/1228
+    # If querying for **only** the ID of the related object, graphene_django_optimizer may raise
+    # AttributeError / TypeError ("Cannot call select_related() after .values()"); retry without optimization.
+    try:
+        return gql_optimizer.query(queryset, info)
+    except (AttributeError, TypeError):
+        logger.debug("Caught exception in graphene_django_optimizer, falling back to un-optimized query")
+        return queryset
+
+
+def _get_batched_peers(info, relationship, side, peer_model):
+    """Return `{parent pk: [peer, ...]}` for every parent on `side` of `relationship`, cached per request.
+
+    Costs one query for the associations and one for the peer objects, regardless of the number of parents.
+    Peers are in the default ordering of the peer model and are not yet filtered by object permissions.
+    """
+    if not hasattr(info.context, "_gql_relationship_cache"):
+        info.context._gql_relationship_cache = {}
+    cache_key = (relationship.pk, side)
+    if cache_key not in info.context._gql_relationship_cache:
+        peer_side = RelationshipSideChoices.OPPOSITE[side]
+        parent_ids_by_peer = {}
+        associations = RelationshipAssociation.objects.filter(relationship=relationship).values_list(
+            "source_id", "destination_id"
+        )
+        for source_id, destination_id in associations:
+            if relationship.symmetric:
+                parent_ids_by_peer.setdefault(destination_id, set()).add(source_id)
+                parent_ids_by_peer.setdefault(source_id, set()).add(destination_id)
+            else:
+                ids = {"source": source_id, "destination": destination_id}
+                parent_ids_by_peer.setdefault(ids[peer_side], set()).add(ids[side])
+
+        peers_by_parent = {}
+        for peer in _optimized_or_plain(peer_model.objects.filter(id__in=parent_ids_by_peer.keys()), info):
+            for parent_id in parent_ids_by_peer[peer.pk]:
+                peers_by_parent.setdefault(parent_id, []).append(peer)
+        info.context._gql_relationship_cache[cache_key] = peers_by_parent
+    return info.context._gql_relationship_cache[cache_key]
+
+
+def _get_peers_for_object(info, obj, relationship, side, peer_model):
+    """Return the permitted peers of a single `obj` as a queryset (used outside of list contexts)."""
+    peer_side = RelationshipSideChoices.OPPOSITE[side]
+    associations = RelationshipAssociation.objects.filter(relationship=relationship)
+    if relationship.symmetric:
+        peer_ids = list(associations.filter(source_id=obj.pk).values_list("destination_id", flat=True))
+        peer_ids += list(associations.filter(destination_id=obj.pk).values_list("source_id", flat=True))
+    else:
+        peer_ids = associations.filter(**{f"{side}_id": obj.pk}).values_list(f"{peer_side}_id", flat=True)
+
+    # Object-permission enforcement on the remote model.
+    peer_queryset = peer_model.objects.filter(id__in=peer_ids)
+    if hasattr(peer_queryset, "restrict"):
+        peer_queryset = peer_queryset.restrict(info.context.user, "view")
+    return peer_queryset
+
+
 def generate_relationship_resolver(name, resolver_name, relationship, side, peer_model):
     """Generate function to resolve each custom relationship within each DjangoObjectType.
+
+    When the parent object is part of a list, associations and peers of the relationship are loaded once per
+    request (see `_get_batched_peers`) rather than once per parent object.
 
     Args:
         name (str): name of the custom field to resolve
@@ -247,80 +315,24 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         side (str): side of the relationship to use for the resolver
         peer_model (Model): Django Model of the peer of this relationship
     """
+    peer_side = RelationshipSideChoices.OPPOSITE[side]
+    has_many = relationship.has_many(peer_side)
 
     def resolve_relationship(self, info, **kwargs):
-        """Return a queryset or an object depending on the type of the relationship."""
-        peer_side = RelationshipSideChoices.OPPOSITE[side]
-        query_params = {"relationship": relationship}
-        # https://github.com/nautobot/nautobot/issues/1228
-        # If querying for **only** the ID of the related object, for example:
-        # { device(id:"...") { ... rel_my_relationship { id } } }
-        # we will get this exception:
-        # TypeError: Cannot call select_related() after .values() or .values_list()
-        # This appears to be a bug in graphene_django_optimizer but I haven't found a known issue on GitHub.
-        # For now we just work around it by catching the exception and retrying without optimization, below...
-        if not relationship.symmetric:
-            # Get the objects on the other side of this relationship
-            query_params[f"{side}_id"] = self.pk
+        """Return a list or an object depending on the type of the relationship."""
+        if _in_list_context(info):
+            peers = _get_batched_peers(info, relationship, side, peer_model).get(self.pk, [])
+            permitted_pks = get_permitted_pks(info, peer_model)
+            if permitted_pks is not None:
+                peers = [peer for peer in peers if peer.pk in permitted_pks]
+            if has_many:
+                return peers
+            return peers[0] if peers else None
 
-            try:
-                queryset_ids = gql_optimizer.query(
-                    RelationshipAssociation.objects.filter(**query_params).values_list(f"{peer_side}_id", flat=True),
-                    info,
-                )
-            except TypeError:
-                logger.debug("Caught TypeError in graphene_django_optimizer, falling back to un-optimized query")
-                queryset_ids = RelationshipAssociation.objects.filter(**query_params).values_list(
-                    f"{peer_side}_id", flat=True
-                )
-        else:
-            # Get objects that are peers for this relationship, regardless of side
-            try:
-                queryset_ids = list(
-                    gql_optimizer.query(
-                        RelationshipAssociation.objects.filter(source_id=self.pk, **query_params).values_list(
-                            "destination_id", flat=True
-                        ),
-                        info,
-                    )
-                )
-                queryset_ids += list(
-                    gql_optimizer.query(
-                        RelationshipAssociation.objects.filter(destination_id=self.pk, **query_params).values_list(
-                            "source_id", flat=True
-                        ),
-                        info,
-                    )
-                )
-            except TypeError:
-                logger.debug("Caught TypeError in graphene_django_optimizer, falling back to un-optimized query")
-                queryset_ids = list(
-                    RelationshipAssociation.objects.filter(source_id=self.pk, **query_params).values_list(
-                        "destination_id", flat=True
-                    ),
-                )
-                queryset_ids += list(
-                    RelationshipAssociation.objects.filter(destination_id=self.pk, **query_params).values_list(
-                        "source_id", flat=True
-                    ),
-                )
-
-        # Object-permission enforcement on the remote model. This resolver already issues a fresh query per
-        # parent object, so `restrict()` only adds a WHERE clause here and does not introduce extra queries.
-        peer_queryset = peer_model.objects.filter(id__in=queryset_ids)
-        if hasattr(peer_queryset, "restrict"):
-            peer_queryset = peer_queryset.restrict(info.context.user, "view")
-
-        if relationship.has_many(peer_side):
-            return gql_optimizer.query(peer_queryset, info)
-
-        # Also apparently a graphene_django_optimizer bug - in the same query case as described above, here we may see:
-        # AttributeError: object has no attribute "only"
-        try:
-            return gql_optimizer.query(peer_queryset.first(), info)
-        except AttributeError:
-            logger.debug("Caught AttributeError in graphene_django_optimizer, falling back to un-optimized query")
-            return peer_queryset.first()
+        peer_queryset = _get_peers_for_object(info, self, relationship, side, peer_model)
+        if has_many:
+            return _optimized_or_plain(peer_queryset, info)
+        return peer_queryset.first()
 
     resolve_relationship.__name__ = resolver_name
     return mark_permission_enforced(resolve_relationship)

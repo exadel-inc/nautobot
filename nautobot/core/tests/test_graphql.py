@@ -11,8 +11,10 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
+from django.db import connection
 from django.db.models import Count, Q
 from django.test import override_settings, tag
+from django.test.utils import CaptureQueriesContext
 from django.test.client import RequestFactory
 from django.urls import reverse
 import graphene.types
@@ -731,6 +733,156 @@ class GraphQLRelatedObjectPermissionTest(GraphQLTestCaseBase):
             "Wrap each with permission_safe_resolver / permission_safe_attribute_resolver (or allow-list with "
             "justification):\n" + "\n".join(sorted(unenforced)),
         )
+
+
+class GraphQLRelationshipResolverQueryCountTest(GraphQLTestCaseBase):
+    """Relationship resolvers must batch their lookups instead of querying per parent object (nautobot#8599)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create(username="rel_count_user", is_active=True, is_superuser=True)
+        cls.location_type = LocationType.objects.get(name="Campus")
+        cls.location_status = Status.objects.get_for_model(Location)[0]
+        cls.rack_status = Status.objects.get_for_model(Rack)[0]
+        cls.vlan_status = Status.objects.get_for_model(VLAN)[0]
+        location_ct = ContentType.objects.get_for_model(Location)
+        vlan_ct = ContentType.objects.get_for_model(VLAN)
+        rack_ct = ContentType.objects.get_for_model(Rack)
+        cls.m2m = Relationship.objects.create(
+            label="Count Location to VLANs",
+            key="count_location_to_vlans",
+            source_type=location_ct,
+            destination_type=vlan_ct,
+            type="many-to-many",
+        )
+        cls.o2m = Relationship.objects.create(
+            label="Count Location to Racks",
+            key="count_location_to_racks",
+            source_type=location_ct,
+            destination_type=rack_ct,
+            type="one-to-many",
+        )
+        cls.symmetric = Relationship.objects.create(
+            label="Count VLAN peers",
+            key="count_vlan_peers",
+            source_type=vlan_ct,
+            destination_type=vlan_ct,
+            type="symmetric-many-to-many",
+        )
+        cls.counter = 0
+        cls.create_parents(2)
+
+    @classmethod
+    def create_parents(cls, count):
+        """Create `count` locations, each with 2 VLANs (m2m), a rack (o2m) and a symmetric VLAN peering."""
+        for _ in range(count):
+            cls.counter += 1
+            n = cls.counter
+            location = Location.objects.create(
+                name=f"Count Location {n:03}", location_type=cls.location_type, status=cls.location_status
+            )
+            rack = Rack.objects.create(name=f"Count Rack {n:03}", location=location, status=cls.rack_status)
+            vlans = [
+                VLAN.objects.create(name=f"Count VLAN {n:03}-{i}", vid=2000 + n * 2 + i, status=cls.vlan_status)
+                for i in range(2)
+            ]
+            for vlan in vlans:
+                RelationshipAssociation.objects.create(relationship=cls.m2m, source=location, destination=vlan)
+            RelationshipAssociation.objects.create(relationship=cls.o2m, source=location, destination=rack)
+            RelationshipAssociation.objects.create(
+                relationship=cls.symmetric, source=vlans[0], destination=vlans[1]
+            )
+
+    def setUp(self):
+        super().setUp()
+        self.schema = rebuild_graphql_schema().graphql_schema
+
+    def _run(self, query):
+        request = RequestFactory().post("/graphql/")
+        request.user = self.user
+        result = execute(schema=self.schema, document=parse(query), context_value=request)
+        self.assertIsNone(result.errors)
+        return result.data
+
+    def _count_queries(self, query):
+        with CaptureQueriesContext(connection) as ctx:
+            data = self._run(query)
+        return len(ctx), data
+
+    def test_list_query_count_does_not_grow_with_parents(self):
+        """List queries with relationship fields issue the same number of queries for N and 2N parents."""
+        locations_query = """
+        query { locations(name__isw: "Count Location") {
+            name rel_count_location_to_vlans { name } rel_count_location_to_racks { name }
+        } }
+        """
+        racks_query = """
+        query { racks(name__isw: "Count Rack") { name rel_count_location_to_racks { name } } }
+        """
+        vlans_query = """
+        query { vlans(name__isw: "Count VLAN") { name rel_count_vlan_peers { name } } }
+        """
+        for query in (locations_query, racks_query, vlans_query):
+            with self.subTest(query=query):
+                self._run(query)  # warm up caches (content types etc.)
+                small_count, small_data = self._count_queries(query)
+                self.create_parents(2)
+                large_count, large_data = self._count_queries(query)
+                self.assertEqual(small_count, large_count)
+                self.assertGreater(len(list(large_data.values())[0]), len(list(small_data.values())[0]))
+
+    def test_results(self):
+        """Peers, ordering, single-vs-list and symmetric directions are as expected."""
+        location = Location.objects.get(name="Count Location 001")
+        lone_location = Location.objects.create(
+            name="Count Location 000", location_type=self.location_type, status=self.location_status
+        )
+        data = self._run(
+            """
+            query { locations(name__isw: "Count Location 00") {
+                name rel_count_location_to_vlans { name } rel_count_location_to_racks { name }
+            } }
+            """
+        )
+        by_name = {loc["name"]: loc for loc in data["locations"]}
+        self.assertEqual(
+            [v["name"] for v in by_name[location.name]["rel_count_location_to_vlans"]],
+            ["Count VLAN 001-0", "Count VLAN 001-1"],
+        )
+        self.assertEqual(
+            [r["name"] for r in by_name[location.name]["rel_count_location_to_racks"]], ["Count Rack 001"]
+        )
+        self.assertEqual(by_name[lone_location.name]["rel_count_location_to_vlans"], [])
+        self.assertEqual(by_name[lone_location.name]["rel_count_location_to_racks"], [])
+
+        data = self._run(
+            """
+            query { racks(name__isw: "Count Rack 00") { name rel_count_location_to_racks { name } } }
+            """
+        )
+        for rack in data["racks"]:
+            self.assertIsInstance(rack["rel_count_location_to_racks"], dict)
+        Rack.objects.create(name="Count Rack Orphan", location=lone_location, status=self.rack_status)
+        data = self._run('query { racks(name: "Count Rack Orphan") { rel_count_location_to_racks { name } } }')
+        self.assertIsNone(data["racks"][0]["rel_count_location_to_racks"])
+
+        data = self._run('query { vlans(name__isw: "Count VLAN 001") { name rel_count_vlan_peers { name } } }')
+        peers = {v["name"]: [p["name"] for p in v["rel_count_vlan_peers"]] for v in data["vlans"]}
+        self.assertEqual(peers, {"Count VLAN 001-0": ["Count VLAN 001-1"], "Count VLAN 001-1": ["Count VLAN 001-0"]})
+
+    def test_single_object_queries(self):
+        """Single-object queries, including id-only selections (#1228), still work."""
+        location = Location.objects.get(name="Count Location 001")
+        data = self._run(
+            f'query {{ location(id: "{location.pk}") {{ rel_count_location_to_vlans {{ id }} '
+            "rel_count_location_to_racks { id } } }"
+        )
+        self.assertEqual(len(data["location"]["rel_count_location_to_vlans"]), 2)
+        self.assertIsNotNone(data["location"]["rel_count_location_to_racks"])
+        data = self._run(
+            f'query {{ locations(id: "{location.pk}") {{ rel_count_location_to_vlans {{ id }} }} }}'
+        )
+        self.assertEqual(len(data["locations"][0]["rel_count_location_to_vlans"]), 2)
 
 
 class GraphQLExtendSchemaType(GraphQLTestCaseBase):
