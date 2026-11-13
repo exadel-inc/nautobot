@@ -3634,6 +3634,16 @@ class ModuleTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         self.assertIn("Module View Nested Bay", children_body)
 
 
+def _create_module_in_device_bay(device, name):
+    """Create a Module installed in a new ModuleBay of `device`."""
+    module_bay = ModuleBay.objects.create(parent_device=device, name=f"{name} Bay", position="1")
+    return Module.objects.create(
+        module_type=ModuleType.objects.create(manufacturer=Manufacturer.objects.first(), model=f"{name} Module Type"),
+        parent_module_bay=module_bay,
+        status=Status.objects.get_for_model(Module).first(),
+    )
+
+
 class ConsolePortTestCase(ViewTestCases.DeviceComponentViewTestCase):
     model = ConsolePort
     allowed_number_of_tree_queries_per_view_type = {"retrieve": 1}
@@ -3695,6 +3705,28 @@ class ConsolePortTestCase(ViewTestCases.DeviceComponentViewTestCase):
             "label": "new test label",
             "description": "new test description",
         }
+
+    def test_create_with_module_from_device_prefilled_add_form(self):
+        """The Module selected on an add form opened with `?device=<pk>` is kept (#9589)."""
+        self.add_permissions("dcim.add_consoleport", "dcim.view_module")
+        device = Device.objects.first()
+        module = _create_module_in_device_bay(device, "Console Port Prefilled")
+
+        request = {
+            "path": f"{self._get_url('add')}?device={device.pk}",
+            "data": post_data(
+                {
+                    "device": device.pk,
+                    "module": module.pk,
+                    "name_pattern": "Console Port Prefilled 1",
+                    "type": ConsolePortTypeChoices.TYPE_RJ45,
+                }
+            ),
+        }
+        self.assertHttpStatus(self.client.post(**request), 302)
+        console_port = ConsolePort.objects.get(name="Console Port Prefilled 1")
+        self.assertEqual(console_port.module, module)
+        self.assertEqual(console_port.device, device)
 
     def test_get_selected_objects_parents_name_empty(self):
         """Covers the empty-queryset branch (`return ""`) in get_selected_objects_parents_name."""
@@ -4229,6 +4261,57 @@ class InterfaceTestCase(ViewTestCases.DeviceComponentViewTestCase):
         interface = Interface.objects.get(module=module, name="Module Interface Create 1")
         self.assertIsNone(interface.device)
         self.assertEqual(list(interface.tagged_vlans.all()), [vlan])
+
+    def test_create_with_module_from_device_prefilled_add_form(self):
+        """The Module selected on an add form opened with `?device=<pk>` is kept (#9589)."""
+        self.add_permissions("dcim.add_interface", "dcim.view_module", "extras.view_status")
+        device = Device.objects.first()
+        module = _create_module_in_device_bay(device, "Interface Prefilled")
+
+        request = {
+            "path": f"{self._get_url('add')}?device={device.pk}",
+            "data": post_data(
+                {
+                    "device": device.pk,
+                    "module": module.pk,
+                    "name_pattern": "Interface Prefilled 1",
+                    "status": Status.objects.get_for_model(Interface).first().pk,
+                    "type": InterfaceTypeChoices.TYPE_1GE_FIXED,
+                }
+            ),
+        }
+        self.assertHttpStatus(self.client.post(**request), 302)
+        interface = Interface.objects.get(name="Interface Prefilled 1")
+        self.assertEqual(interface.module, module)
+        self.assertEqual(interface.device, device)
+
+    def test_create_with_module_query_string(self):
+        """An add form opened with `?module=<pk>` still creates the interface on that Module."""
+        self.add_permissions("dcim.add_interface", "dcim.view_module", "extras.view_status")
+        device = Device.objects.first()
+        module = _create_module_in_device_bay(device, "Interface Module Query")
+
+        request = {
+            "path": f"{self._get_url('add')}?module={module.pk}",
+            "data": post_data(
+                {
+                    "module": module.pk,
+                    "name_pattern": "Interface Module Query 1",
+                    "status": Status.objects.get_for_model(Interface).first().pk,
+                    "type": InterfaceTypeChoices.TYPE_1GE_FIXED,
+                }
+            ),
+        }
+        self.assertHttpStatus(self.client.post(**request), 302)
+        self.assertEqual(Interface.objects.get(name="Interface Module Query 1").module, module)
+
+    def test_add_form_get_prefills_device(self):
+        """A GET of the add form with `?device=<pk>` still pre-fills the Device."""
+        self.add_permissions("dcim.add_interface", "dcim.view_device", "dcim.view_module", "extras.view_status")
+        device = Device.objects.first()
+        response = self.client.get(f"{self._get_url('add')}?device={device.pk}")
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(str(response.context["form"].initial["device"]), str(device.pk))
 
     def test_create_interface_on_module_in_module_bay(self):
         """A tagged interface created on a Module in a ModuleBay is scoped by that bay's parent Device."""

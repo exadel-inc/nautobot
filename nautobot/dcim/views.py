@@ -2270,10 +2270,11 @@ class ComponentCreateViewMixin(ObjectEditViewMixin):
 
     def get_component_model_form(self, request, data=None):
         """Return the per-instance component model form used to validate/save each expanded child."""
-        return self.form_class(  # pylint: disable=not-callable
-            data or None,
-            initial=normalize_querydict(request.GET, form_class=self.form_class),
-        )
+        # Only seed from the query string when unbound: on POST the bulk create form's `cleaned_data` already
+        # carries device/module/etc., and a GET-derived `device` initial would make ModularComponentEditForm
+        # disable (and so discard the submitted) `module`.
+        initial = None if data else normalize_querydict(request.GET, form_class=self.form_class)
+        return self.form_class(data or None, initial=initial)  # pylint: disable=not-callable
 
     def create(self, request, *args, **kwargs):
         """

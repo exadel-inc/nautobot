@@ -424,6 +424,23 @@ class VMInterfaceTestCase(ViewTestCases.DeviceComponentViewTestCase):
         data["name_pattern"] = "BRIDGE"
         return data
 
+    def test_bulk_create_from_virtual_machine_prefilled_add_form(self):
+        """Bulk create via an add form opened with `?virtual_machine=<pk>` still works."""
+        self.add_permissions("virtualization.add_vminterface", "virtualization.view_virtualmachine")
+        vm = VirtualMachine.objects.first()
+        request = {
+            "path": f"{self._get_url('add')}?virtual_machine={vm.pk}",
+            "data": post_data(
+                {
+                    "virtual_machine": vm.pk,
+                    "name_pattern": "Prefilled [1-2]",
+                    "status": Status.objects.get_for_model(VMInterface).first().pk,
+                }
+            ),
+        }
+        self.assertHttpStatus(self.client.post(**request), 302)
+        self.assertEqual(VMInterface.objects.filter(virtual_machine=vm, name__startswith="Prefilled ").count(), 2)
+
     @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
     def test_detail_view_includes_untagged_and_tagged_vlans_in_vlan_table(self):
         """
