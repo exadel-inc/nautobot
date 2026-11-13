@@ -1617,6 +1617,26 @@ class IPAddressTest(APIViewTestCases.APIViewTestCase):
             self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
             self.assertIn("dns_name", response.data)
 
+    def test_update_invalid_dns_name(self):
+        """Regression test for #8827: invalid hostnames are rejected on dns_name when updating."""
+        self.add_permissions("ipam.change_ipaddress")
+
+        ip_address = IPAddress.objects.create(
+            address="192.168.0.100/24",
+            namespace=self.namespace,
+            status=self.statuses[0],
+            dns_name="valid-hostname.example.com",
+        )
+        url = self._get_detail_url(ip_address)
+
+        for bad_dns_name in ("whatever-.your.tld", "foo_bar.example.com", "a..b"):
+            response = self.client.patch(url, {"dns_name": bad_dns_name}, format="json", **self.header)
+            self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+            self.assertIn("dns_name", response.data)
+
+        ip_address.refresh_from_db()
+        self.assertEqual(ip_address.dns_name, "valid-hostname.example.com")
+
     def test_create_multiple_outside_nat_success(self):
         """Validate NAT inside address can tie to multiple NAT outside addresses."""
         # Create the two outside NAT IP Addresses tied back to the single inside NAT address
