@@ -1054,6 +1054,79 @@ class GraphQLRelationshipQueryCountTest(GraphQLTestCaseBase):
             expected = {f"RelBatchLarge VLAN {i}", f"RelBatchLarge VLAN {(i + 1) % self.LARGE}"}
             self.assertEqual({v["name"] for v in loc["rel_batch_location_to_vlans"]}, expected)
 
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_shared_fragment_at_different_depths_does_not_cross_contaminate_cache(self):
+        """A relationship field spread via a shared fragment at two depths must not share cached bulk data.
+
+        `locations { children: rel_x { ...F } ...F }`, with `F` containing `rel_x`, reuses the very same AST
+        field node for both: the top-level `...F` resolves `rel_x` as a direct child of the root `locations`
+        queryset, while the nested one (inside `children`) resolves `rel_x` of a peer reached through another
+        relationship field. Both share the same root field key, so unless the cache also accounts for
+        traversal depth, the nested use-site would reuse the top-level one's root-scoped bulk data and
+        silently drop its own peers.
+        """
+        location_type = LocationType.objects.get(name="Campus")
+        location_status = Status.objects.get_for_model(Location)[0]
+        self_ref = Relationship.objects.create(
+            label="Batch Depth Self Ref",
+            key="batch_depth_self_ref",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(Location),
+            type="many-to-many",
+        )
+        names = [
+            "RelDepthRoot A",
+            "RelDepthRoot B",
+            "RelDepthChild A1",
+            "RelDepthChild B1",
+            "RelDepthLeaf A2",
+            "RelDepthLeaf B2",
+        ]
+        root_a, root_b, child_a1, child_b1, leaf_a2, leaf_b2 = (
+            Location.objects.create(name=name, location_type=location_type, status=location_status)
+            for name in names
+        )
+        RelationshipAssociation.objects.create(relationship=self_ref, source=root_a, destination=child_a1)
+        RelationshipAssociation.objects.create(relationship=self_ref, source=root_b, destination=child_b1)
+        RelationshipAssociation.objects.create(relationship=self_ref, source=child_a1, destination=leaf_a2)
+        RelationshipAssociation.objects.create(relationship=self_ref, source=child_b1, destination=leaf_b2)
+
+        schema = rebuild_graphql_schema()
+        query = """
+        query {
+            locations(name__ic: "RelDepthRoot") {
+                name
+                children: rel_batch_depth_self_ref_destination { ...F }
+                ...F
+            }
+        }
+        fragment F on LocationType {
+            name
+            rel_batch_depth_self_ref_destination { name }
+        }
+        """
+        data, _ = self._run(schema, query, self.user)
+        by_name = {loc["name"]: loc for loc in data["locations"]}
+
+        # Top-level `...F` (direct child of the root queryset): each root's own single child.
+        self.assertEqual(
+            {p["name"] for p in by_name["RelDepthRoot A"]["rel_batch_depth_self_ref_destination"]},
+            {"RelDepthChild A1"},
+        )
+        self.assertEqual(
+            {p["name"] for p in by_name["RelDepthRoot B"]["rel_batch_depth_self_ref_destination"]},
+            {"RelDepthChild B1"},
+        )
+        # Nested `...F` (inside `children`, i.e. a peer of a peer): each child's own leaf, not its root's child.
+        child_a = by_name["RelDepthRoot A"]["children"][0]
+        child_b = by_name["RelDepthRoot B"]["children"][0]
+        self.assertEqual(
+            {p["name"] for p in child_a["rel_batch_depth_self_ref_destination"]}, {"RelDepthLeaf A2"}
+        )
+        self.assertEqual(
+            {p["name"] for p in child_b["rel_batch_depth_self_ref_destination"]}, {"RelDepthLeaf B2"}
+        )
+
 
 class GraphQLExtendSchemaType(GraphQLTestCaseBase):
     def setUp(self):

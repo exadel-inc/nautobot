@@ -39,6 +39,23 @@ def _root_field_key(path):
     return path.key
 
 
+def _traversal_scope_key(path):
+    """Stable key for where in the query's shape a field occurs, ignoring list indices.
+
+    A fragment spread at two different depths/use-sites (e.g. shared under both a direct root child and a
+    nested peer reached through another relationship field) reuses the very same AST field node objects, so
+    identity of those nodes - or of the root field alone - cannot tell the use-sites apart. The full chain of
+    field/alias keys from root to this field can: it differs between use-sites, while staying identical across
+    list items/parent rows resolved at the same use-site, so the bulk cache below still batches across parents.
+    """
+    keys = []
+    while path is not None:
+        if not isinstance(path.key, int):
+            keys.append(path.key)
+        path = path.prev
+    return tuple(reversed(keys))
+
+
 def _is_direct_root_child_path(path):
     """True when `path` is a field on an object fetched directly by the root list query.
 
@@ -383,10 +400,11 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         if cached_operation is not info.operation:
             cache = {}
             info.context._gql_relationship_cache = (info.operation, cache)
-        # A shared fragment reuses the same field nodes under every root alias that spreads it, so the root
-        # key must be part of the cache key too - otherwise the second alias would reuse the first alias's
-        # root-scoped bulk data (see `requested_parent_pks`) and silently drop its own peers.
-        cache_key = (relationship.pk, side, _root_field_key(info.path), tuple(id(node) for node in info.field_nodes))
+        # A shared fragment reuses the same field nodes at every depth/alias it is spread under, so the cache
+        # key is keyed on the full traversal scope rather than the root alias or node identity alone -
+        # otherwise a second use-site would reuse the first one's root-scoped bulk data (see
+        # `requested_parent_pks`) and silently drop its own peers.
+        cache_key = (relationship.pk, side, _traversal_scope_key(info.path))
 
         if cache_key not in cache:
             cache[cache_key] = None  # seen once; the bulk data is only loaded if there's a second parent
