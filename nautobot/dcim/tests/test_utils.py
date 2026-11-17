@@ -324,3 +324,43 @@ class GetCablePkTestCase(TestCase):
     def test_get_cable_pk_uncabled_interface_returns_empty_string(self):
         self.assertIsNone(self.uncabled_interface.cable)
         self.assertEqual(get_cable_pk(self.uncabled_interface), "")
+
+    def test_get_cable_pk_breakout_child_on_unoccupied_lane_returns_empty_string(self):
+        status_active = Status.objects.get_for_model(Interface).get(name="Active")
+        status_connected = Status.objects.get_for_model(Cable).get(name="Connected")
+        spine_device = create_test_device("Partial Breakout Spine Device")
+        leaf_device = create_test_device("Partial Breakout Leaf Device")
+        trunk = Interface.objects.create(
+            device=spine_device,
+            name="Partial Trunk",
+            type=InterfaceTypeChoices.TYPE_40GE_QSFP_PLUS,
+            status=status_active,
+        )
+        children = [
+            Interface.objects.create(
+                device=spine_device,
+                name=f"Partial Trunk/{position}",
+                type=InterfaceTypeChoices.TYPE_VIRTUAL,
+                status=status_active,
+                parent_interface=trunk,
+                breakout_position=position,
+            )
+            for position in (1, 2)
+        ]
+        leaf = Interface.objects.create(device=leaf_device, name="Partial Leaf 1", status=status_active)
+        # Only connector 1 of the breakout side is cabled; lane 2 is left unoccupied.
+        cable = Cable(
+            termination_a=trunk,
+            termination_b=leaf,
+            cable_type=CableType.objects.create(
+                name="1x2 Partial Breakout Cable", a_connectors=1, b_connectors=2, total_lanes=2
+            ),
+            status=status_connected,
+        )
+        cable.save()
+
+        occupied, unoccupied = (Interface.objects.get(pk=child.pk) for child in children)
+        self.assertEqual(get_cable_pk(occupied), cable.pk)
+        self.assertIsNone(unoccupied.get_breakout_lane().far_termination)
+        self.assertEqual(get_cable_pk(unoccupied), "")
+        self.assertEqual(cable_status_color_css(unoccupied), "")
