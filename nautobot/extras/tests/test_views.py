@@ -3258,8 +3258,9 @@ class GitRepositoryTestCase(
         job_model.default_job_queue = queue
         job_model.save()
 
-        with mock.patch("nautobot.extras.utils.build_kubernetes_api_client"), mock.patch(
-            "nautobot.extras.utils.kubernetes.client.BatchV1Api"
+        with (
+            mock.patch("nautobot.extras.utils.build_kubernetes_api_client"),
+            mock.patch("nautobot.extras.utils.kubernetes.client.BatchV1Api"),
         ):
             job_result = instance.sync(self.user)
 
