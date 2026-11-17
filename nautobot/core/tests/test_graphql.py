@@ -1083,8 +1083,7 @@ class GraphQLRelationshipQueryCountTest(GraphQLTestCaseBase):
             "RelDepthLeaf B2",
         ]
         root_a, root_b, child_a1, child_b1, leaf_a2, leaf_b2 = (
-            Location.objects.create(name=name, location_type=location_type, status=location_status)
-            for name in names
+            Location.objects.create(name=name, location_type=location_type, status=location_status) for name in names
         )
         RelationshipAssociation.objects.create(relationship=self_ref, source=root_a, destination=child_a1)
         RelationshipAssociation.objects.create(relationship=self_ref, source=root_b, destination=child_b1)
@@ -1120,12 +1119,8 @@ class GraphQLRelationshipQueryCountTest(GraphQLTestCaseBase):
         # Nested `...F` (inside `children`, i.e. a peer of a peer): each child's own leaf, not its root's child.
         child_a = by_name["RelDepthRoot A"]["children"][0]
         child_b = by_name["RelDepthRoot B"]["children"][0]
-        self.assertEqual(
-            {p["name"] for p in child_a["rel_batch_depth_self_ref_destination"]}, {"RelDepthLeaf A2"}
-        )
-        self.assertEqual(
-            {p["name"] for p in child_b["rel_batch_depth_self_ref_destination"]}, {"RelDepthLeaf B2"}
-        )
+        self.assertEqual({p["name"] for p in child_a["rel_batch_depth_self_ref_destination"]}, {"RelDepthLeaf A2"})
+        self.assertEqual({p["name"] for p in child_b["rel_batch_depth_self_ref_destination"]}, {"RelDepthLeaf B2"})
 
 
 class GraphQLExtendSchemaType(GraphQLTestCaseBase):
