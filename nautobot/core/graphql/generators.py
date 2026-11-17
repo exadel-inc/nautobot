@@ -250,19 +250,21 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
 
     peer_side = RelationshipSideChoices.OPPOSITE[side]
 
-    def optimized(queryset, info):
-        """Apply graphene_django_optimizer, falling back to the plain queryset if it can't handle it."""
+    def optimized(queryset, info, tolerated_error):
+        """Apply graphene_django_optimizer, falling back to the plain queryset on the one known error."""
         # https://github.com/nautobot/nautobot/issues/1228
         # If querying for **only** the ID of the related object, for example:
         # { device(id:"...") { ... rel_my_relationship { id } } }
-        # we will get this exception:
+        # we will get this exception for the values_list() of association IDs:
         # TypeError: Cannot call select_related() after .values() or .values_list()
         # This appears to be a bug in graphene_django_optimizer but I haven't found a known issue on GitHub.
         # Similarly, we may see "AttributeError: object has no attribute 'only'" when optimizing a single object.
         try:
             return gql_optimizer.query(queryset, info)
-        except (TypeError, AttributeError):
-            logger.debug("Caught error in graphene_django_optimizer, falling back to un-optimized query")
+        except tolerated_error:
+            logger.debug(
+                "Caught %s in graphene_django_optimizer, falling back to un-optimized query", tolerated_error.__name__
+            )
             return queryset
 
     def restricted_peers(peer_ids, info):
@@ -273,18 +275,28 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         return peer_queryset
 
     def associated_peer_ids(parent_pk, info):
-        """IDs of the peers of a single parent object (2 queries for symmetric relationships, otherwise 1)."""
+        """IDs of the peers of a single parent object.
+
+        Non-symmetric relationships return a lazy queryset (used as a subquery, so no query of its own);
+        symmetric ones need two queries, one per direction.
+        """
         associations = RelationshipAssociation.objects.filter(relationship=relationship)
         if not relationship.symmetric:
-            id_querysets = [associations.filter(**{f"{side}_id": parent_pk}).values_list(f"{peer_side}_id", flat=True)]
-        else:
-            id_querysets = [
-                associations.filter(source_id=parent_pk).values_list("destination_id", flat=True),
-                associations.filter(destination_id=parent_pk).values_list("source_id", flat=True),
-            ]
-        peer_ids = []
-        for id_queryset in id_querysets:
-            peer_ids += list(optimized(id_queryset, info))
+            return optimized(
+                associations.filter(**{f"{side}_id": parent_pk}).values_list(f"{peer_side}_id", flat=True),
+                info,
+                TypeError,
+            )
+        peer_ids = list(
+            optimized(
+                associations.filter(source_id=parent_pk).values_list("destination_id", flat=True), info, TypeError
+            )
+        )
+        peer_ids += list(
+            optimized(
+                associations.filter(destination_id=parent_pk).values_list("source_id", flat=True), info, TypeError
+            )
+        )
         return peer_ids
 
     def bulk_peers_by_parent(info, cache, cache_key):
@@ -310,19 +322,22 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
             # Permission enforcement: peers the user may not view are absent here, so are never returned.
             peers = {
                 peer.pk: (position, peer)
-                for position, peer in enumerate(optimized(restricted_peers(all_peer_ids, info), info))
+                for position, peer in enumerate(gql_optimizer.query(restricted_peers(all_peer_ids, info), info))
             }
             cache[cache_key] = ({parent_id: list(peers_) for parent_id, peers_ in peer_ids_by_parent.items()}, peers)
         return cache[cache_key]
 
     def resolve_relationship(self, info, **kwargs):
         """Return a list or an object depending on the type of the relationship."""
-        # Per-request cache, never shared between requests/users. graphene-django resolves each parent object
-        # independently, so the first resolution of a given field in a request (e.g. `device(id: ...)`) queries
+        # Per-request, per-execution cache, never shared between requests/users. graphene-django resolves each
+        # parent object independently, so the first resolution of a given field (e.g. `device(id: ...)`) queries
         # for just that parent; any further resolution (a list of parents) switches to loading everything at once.
-        cache = getattr(info.context, "_gql_relationship_cache", None)
-        if cache is None:
-            cache = info.context._gql_relationship_cache = {}
+        # The cache holds a reference to the operation it belongs to: the `id()` of its AST nodes can't be reused
+        # while it is alive, and a different execution using the same request starts with an empty cache.
+        cached_operation, cache = getattr(info.context, "_gql_relationship_cache", (None, None))
+        if cached_operation is not info.operation:
+            cache = {}
+            info.context._gql_relationship_cache = (info.operation, cache)
         cache_key = (relationship.pk, side, tuple(id(node) for node in info.field_nodes))
 
         if cache_key not in cache:
@@ -330,7 +345,7 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
             peer_queryset = restricted_peers(associated_peer_ids(self.pk, info), info)
             if relationship.has_many(peer_side):
                 return gql_optimizer.query(peer_queryset, info)
-            return optimized(peer_queryset.first(), info)
+            return optimized(peer_queryset.first(), info, AttributeError)
 
         peer_ids_by_parent, peers = bulk_peers_by_parent(info, cache, cache_key)
         permitted = sorted(

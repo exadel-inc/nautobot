@@ -879,12 +879,11 @@ class GraphQLRelationshipQueryCountTest(GraphQLTestCaseBase):
             self.assertIsInstance(loc["rel_batch_location_owns_vlan"], list)
             self.assertEqual(len(loc["rel_batch_location_owns_vlan"]), 1)
         # A VLAN with no association yields null.
-        orphan = VLAN.objects.create(name="RelBatchOrphan VLAN", vid=3999, status=Status.objects.get_for_model(VLAN)[0])
+        VLAN.objects.create(name="RelBatchOrphan VLAN", vid=3999, status=Status.objects.get_for_model(VLAN)[0])
         data, _ = self._run(
             schema, 'query { vlans(name__ic: "RelBatchOrphan") { rel_batch_location_owns_vlan { name } } }', self.user
         )
         self.assertEqual(data["vlans"], [{"rel_batch_location_owns_vlan": None}])
-        orphan.delete()
 
     def test_constrained_user_sees_only_permitted_peers_without_n_plus_one(self):
         self._grant_view(self.user, Location)
@@ -903,8 +902,42 @@ class GraphQLRelationshipQueryCountTest(GraphQLTestCaseBase):
         query = f'query {{ location(id: "{loc.pk}") {{ rel_batch_location_to_vlans {{ name }} }} }}'
         data, count = self._run(schema, query, self.user)
         self.assertEqual(len(data["location"]["rel_batch_location_to_vlans"]), 2)
-        # One query for the location, one for associations, one for peers (plus none extra).
-        self.assertLessEqual(count, 3)
+        # One query for the location, one for the peers (associations are a subquery of it).
+        self.assertEqual(count, 2)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_peer_order_matches_peer_queryset_order(self):
+        """First-call (queryset) and bulk (list) paths return peers in the peer model's queryset order."""
+        schema = rebuild_graphql_schema()
+        data, _ = self._run(
+            schema,
+            'query { locations(name__ic: "RelBatchLarge") { id rel_batch_location_to_vlans { id } } }',
+            self.user,
+        )
+        for loc in data["locations"]:
+            ids = [v["id"] for v in loc["rel_batch_location_to_vlans"]]
+            expected = [str(pk) for pk in VLAN.objects.filter(pk__in=ids).values_list("pk", flat=True)]
+            self.assertEqual(ids, expected)
+        first = data["locations"][0]
+        single, _ = self._run(
+            schema, f'query {{ location(id: "{first["id"]}") {{ rel_batch_location_to_vlans {{ id }} }} }}', self.user
+        )
+        self.assertEqual(single["location"]["rel_batch_location_to_vlans"], first["rel_batch_location_to_vlans"])
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_cache_not_reused_across_executions_of_same_request(self):
+        """A second execution with the same request object must not see peers cached by the first."""
+        schema = rebuild_graphql_schema()
+        request = RequestFactory().post("/graphql/")
+        request.user = self.user
+        query = 'query { locations(name__ic: "RelBatchSmall") { name rel_batch_location_to_vlans { name } } }'
+        first = execute(schema=schema.graphql_schema, document=parse(query), context_value=request)
+        self.assertIsNone(first.errors)
+        RelationshipAssociation.objects.filter(relationship=self.m2m, source_id=self.locations["Small"][0].pk).delete()
+        second = execute(schema=schema.graphql_schema, document=parse(query), context_value=request)
+        self.assertIsNone(second.errors)
+        by_name = {loc["name"]: loc for loc in second.data["locations"]}
+        self.assertEqual(by_name["RelBatchSmall Loc 0"]["rel_batch_location_to_vlans"], [])
 
 
 class GraphQLExtendSchemaType(GraphQLTestCaseBase):
