@@ -5169,11 +5169,11 @@ class DeviceLocationHierarchyFilterTestCase(TestCase):
         return result
 
     def test_parent_location_includes_descendants(self):
-        for name in self.cases:
+        for name, (filterset, queryset, _) in self.cases.items():
             for value in (self.parent.name, str(self.parent.pk)):
                 with self.subTest(filterset=name, value=value):
                     result = self._assert_filter(name, {"location": [value]}, {self.child})
-                    leaf_result = self.cases[name][0]({"location": [self.child.name]}, self.cases[name][1]).qs
+                    leaf_result = filterset({"location": [self.child.name]}, queryset).qs
                     self.assertEqual(set(result), set(leaf_result.distinct()))
 
     def test_leaf_location_excludes_other_locations(self):
