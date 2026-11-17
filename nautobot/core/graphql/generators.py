@@ -3,6 +3,7 @@
 import logging
 
 from django.core.exceptions import ObjectDoesNotExist
+from django.db.models import Q
 import graphene
 import graphene_django_optimizer as gql_optimizer
 from graphql import GraphQLError
@@ -24,6 +25,18 @@ RESOLVER_PREFIX = "resolve_"
 
 
 LIST_SEARCH_PARAMS_BY_SCHEMA_TYPE = {}
+
+
+def _root_field_key(path):
+    """Walk a GraphQLResolveInfo path up to the root query field and return its response key.
+
+    Stable for every row/subfield resolved underneath one root field occurrence (e.g. all items of a
+    `locations(...)` list and their nested selections share the same root key), and distinct from any other
+    root field occurrence in the same operation, even one selecting the same type under a different alias.
+    """
+    while path.prev is not None:
+        path = path.prev
+    return path.key
 
 
 def _graphql_selection_requests_field(info, field_name):
@@ -299,17 +312,39 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         )
         return peer_ids
 
-    def bulk_peers_by_parent(info, cache, cache_key):
+    def requested_parent_pks(parent_model, info):
+        """PKs of the root queryset `self` was drawn from, if resolution reached here through one.
+
+        Lets the bulk query below scope to just the parents this request actually asked for, instead of every
+        row of the relationship. `None` when there isn't one to trust (e.g. these parents are themselves peers
+        reached via another relationship field, rather than a direct root `locations(...)`-style query) - the
+        caller then falls back to loading the whole relationship, as before. The queryset was already fully
+        fetched by the time any of its rows' fields are being resolved, so reading its pks here costs no query.
+        """
+        root_querysets = getattr(info.context, "_gql_root_querysets", None)
+        entry = root_querysets.get((info.operation, _root_field_key(info.path))) if root_querysets else None
+        if entry is None or entry[0] is not parent_model:
+            return None
+        return [obj.pk for obj in entry[1]]
+
+    def bulk_peers_by_parent(parent_model, info, cache, cache_key):
         """Return `({parent_pk: [peer_pk, ...]}, {peer_pk: (position, peer_obj)})`, loading it on first use.
 
-        All associations of the relationship are loaded in one query and all permitted peers in another, regardless
-        of how many parent objects the request actually covers; this is cheaper than 1+ queries per parent object.
+        Associations are loaded in one query, scoped to the requested parents when known (see
+        `requested_parent_pks`), and all permitted peers in another; this is cheaper than 1+ queries per parent.
         """
         if cache[cache_key] is None:
             peer_ids_by_parent = {}
-            for source_id, destination_id in RelationshipAssociation.objects.filter(
-                relationship=relationship
-            ).values_list("source_id", "destination_id"):
+            associations = RelationshipAssociation.objects.filter(relationship=relationship)
+            parent_pks = requested_parent_pks(parent_model, info)
+            if parent_pks is not None:
+                if relationship.symmetric:
+                    associations = associations.filter(
+                        Q(source_id__in=parent_pks) | Q(destination_id__in=parent_pks)
+                    )
+                else:
+                    associations = associations.filter(**{f"{side}_id__in": parent_pks})
+            for source_id, destination_id in associations.values_list("source_id", "destination_id"):
                 if relationship.symmetric:
                     pairs = [(source_id, destination_id), (destination_id, source_id)]
                 elif side == "source":
@@ -347,7 +382,7 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
                 return gql_optimizer.query(peer_queryset, info)
             return optimized(peer_queryset.first(), info, AttributeError)
 
-        peer_ids_by_parent, peers = bulk_peers_by_parent(info, cache, cache_key)
+        peer_ids_by_parent, peers = bulk_peers_by_parent(type(self), info, cache, cache_key)
         permitted = sorted(
             (peers[peer_id] for peer_id in peer_ids_by_parent.get(self.pk, ()) if peer_id in peers),
             key=lambda position_and_peer: position_and_peer[0],
@@ -506,7 +541,15 @@ def generate_list_resolver(schema_type, resolver_name):
         if limit:
             qs = qs[:limit]
 
-        return gql_optimizer.query(qs, info)
+        qs = gql_optimizer.query(qs, info)
+        # Lets relationship resolvers scope their bulk association lookups to the parents this query actually
+        # returns, rather than every object with that relationship, by keying on this root field's occurrence
+        # in the document (see _root_field_key) rather than just `model`: a nested relationship field reached
+        # through a *different* root query/type must not mistake this list for its own parents.
+        if not hasattr(info.context, "_gql_root_querysets"):
+            info.context._gql_root_querysets = {}
+        info.context._gql_root_querysets[(info.operation, _root_field_key(info.path))] = (model, qs)
+        return qs
 
     list_resolver.__name__ = resolver_name
     return list_resolver

@@ -939,6 +939,46 @@ class GraphQLRelationshipQueryCountTest(GraphQLTestCaseBase):
         by_name = {loc["name"]: loc for loc in second.data["locations"]}
         self.assertEqual(by_name["RelBatchSmall Loc 0"]["rel_batch_location_to_vlans"], [])
 
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_bulk_query_scoped_to_requested_parents(self):
+        """The bulk association lookup must filter by the queried parents, not load the whole relationship.
+
+        A constant query *count* (as asserted elsewhere in this class) doesn't catch a query that stays at one
+        execution but scans every association of the relationship; this inspects the query's SQL instead.
+        """
+        location_type = LocationType.objects.get(name="Campus")
+        location_status = Status.objects.get_for_model(Location)[0]
+        vlan_status = Status.objects.get_for_model(VLAN)[0]
+        unrelated_locations = [
+            Location.objects.create(
+                name=f"RelBatchUnrelated Loc {i}", location_type=location_type, status=location_status
+            )
+            for i in range(200)
+        ]
+        for i, loc in enumerate(unrelated_locations):
+            vlan = VLAN.objects.create(name=f"RelBatchUnrelated VLAN {i}", vid=4500 + i, status=vlan_status)
+            RelationshipAssociation.objects.create(relationship=self.m2m, source=loc, destination=vlan)
+
+        schema = rebuild_graphql_schema()
+        request = RequestFactory().post("/graphql/")
+        request.user = self.user
+        query = 'query { locations(name__ic: "RelBatchSmall") { name rel_batch_location_to_vlans { name } } }'
+        with CaptureQueriesContext(connection) as ctx:
+            result = execute(schema=schema.graphql_schema, document=parse(query), context_value=request)
+        self.assertIsNone(result.errors)
+
+        # The bulk lookup selects both columns straight off the association table (unlike the single-parent
+        # path's per-object subquery, which selects only one column and is embedded inside the peer query).
+        bulk_queries = [
+            q["sql"]
+            for q in ctx.captured_queries
+            if 'AS "destination_id" FROM "extras_relationshipassociation"' in q["sql"]
+        ]
+        self.assertTrue(bulk_queries, "Expected to find the bulk association lookup query")
+        for sql in bulk_queries:
+            self.assertIn("IN (", sql)
+            for loc in unrelated_locations:
+                self.assertNotIn(str(loc.pk), sql)
 
 class GraphQLExtendSchemaType(GraphQLTestCaseBase):
     def setUp(self):
