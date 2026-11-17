@@ -3247,6 +3247,30 @@ class GitRepositoryTestCase(
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.context["result"], {})
 
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_view_sync_result_with_kubernetes_job_queue(self):
+        """The sync JobResult is findable even though Kubernetes runs never go through the Celery result backend."""
+        from nautobot.core.jobs import GitRepositorySync
+
+        instance = self._get_queryset().first()
+        job_model = GitRepositorySync().job_model
+        queue = JobQueue.objects.create(name="k8s-git-sync", queue_type=JobQueueTypeChoices.TYPE_KUBERNETES)
+        job_model.default_job_queue = queue
+        job_model.save()
+
+        with mock.patch("nautobot.extras.utils.build_kubernetes_api_client"), mock.patch(
+            "nautobot.extras.utils.kubernetes.client.BatchV1Api"
+        ):
+            job_result = instance.sync(self.user)
+
+        self.assertEqual(job_result.task_name, job_model.class_path)
+        self.assertEqual(instance.get_latest_sync(), job_result)
+
+        response = self.client.get(reverse("extras:gitrepository_result", kwargs={"pk": instance.pk}))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["result"], job_result)
+        self.assertNotContains(response, "No synchronization JobResult found.")
+
     def test_post_sync_repo_anonymous(self):
         self.client.logout()
         url = reverse("extras:gitrepository_sync", kwargs={"pk": self._get_queryset().first().pk})
