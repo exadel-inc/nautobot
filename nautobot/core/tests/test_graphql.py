@@ -11,9 +11,11 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
+from django.db import connection
 from django.db.models import Count, Q
 from django.test import override_settings, tag
 from django.test.client import RequestFactory
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 import graphene.types
 from graphene_django.registry import get_global_registry
@@ -731,6 +733,178 @@ class GraphQLRelatedObjectPermissionTest(GraphQLTestCaseBase):
             "Wrap each with permission_safe_resolver / permission_safe_attribute_resolver (or allow-list with "
             "justification):\n" + "\n".join(sorted(unenforced)),
         )
+
+
+class GraphQLRelationshipQueryCountTest(GraphQLTestCaseBase):
+    """Relationship (`rel_*`) fields must not issue per-parent-object queries (#8599)."""
+
+    SMALL = 3
+    LARGE = 12
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create(username="rel_count_user", is_active=True)
+        location_type = LocationType.objects.get(name="Campus")
+        location_status = Status.objects.get_for_model(Location)[0]
+        vlan_status = Status.objects.get_for_model(VLAN)[0]
+
+        cls.m2m = Relationship.objects.create(
+            label="Batch Location to VLANs",
+            key="batch_location_to_vlans",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(VLAN),
+            type="many-to-many",
+        )
+        cls.symmetric = Relationship.objects.create(
+            label="Batch VLAN peers",
+            key="batch_vlan_peers",
+            source_type=ContentType.objects.get_for_model(VLAN),
+            destination_type=ContentType.objects.get_for_model(VLAN),
+            type="symmetric-many-to-many",
+        )
+        cls.one_to_many = Relationship.objects.create(
+            label="Batch Location owns VLAN",
+            key="batch_location_owns_vlan",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(VLAN),
+            type="one-to-many",
+        )
+
+        cls.vlan_vid = 3500
+        cls.vlans = {}
+        cls.locations = {}
+        for group, count in (("Small", cls.SMALL), ("Large", cls.LARGE)):
+            cls.locations[group] = [
+                Location.objects.create(
+                    name=f"RelBatch{group} Loc {i}", location_type=location_type, status=location_status
+                )
+                for i in range(count)
+            ]
+            cls.vlans[group] = []
+            for i in range(count):
+                cls.vlan_vid += 1
+                cls.vlans[group].append(
+                    VLAN.objects.create(name=f"RelBatch{group} VLAN {i}", vid=cls.vlan_vid, status=vlan_status)
+                )
+            for i in range(count):
+                loc = cls.locations[group][i]
+                # Each location gets two VLANs (many-to-many); consecutive locations share a VLAN.
+                for vlan in (cls.vlans[group][i], cls.vlans[group][(i + 1) % count]):
+                    RelationshipAssociation.objects.create(relationship=cls.m2m, source=loc, destination=vlan)
+                # Symmetric: each VLAN peers with the next one.
+                RelationshipAssociation.objects.create(
+                    relationship=cls.symmetric,
+                    source=cls.vlans[group][i],
+                    destination=cls.vlans[group][(i + 1) % count],
+                )
+                # One-to-many: each location owns exactly one VLAN.
+                RelationshipAssociation.objects.create(
+                    relationship=cls.one_to_many, source=loc, destination=cls.vlans[group][i]
+                )
+
+    @staticmethod
+    def _grant_view(user, model, constraints=None):
+        obj_perm = ObjectPermission.objects.create(
+            name=f"View {model._meta.label} for {user.username} ({constraints})",
+            actions=["view"],
+            constraints=constraints or {},
+        )
+        obj_perm.object_types.add(ContentType.objects.get_for_model(model))
+        obj_perm.users.add(user)
+
+    def _run(self, schema, query, user):
+        request = RequestFactory().post("/graphql/")
+        request.user = user
+        with CaptureQueriesContext(connection) as ctx:
+            result = execute(schema=schema.graphql_schema, document=parse(query), context_value=request)
+        self.assertIsNone(result.errors)
+        return result.data, len(ctx)
+
+    def _assert_constant_queries(self, root_field, rel_key, user=None):
+        """Query the same field for SMALL and LARGE sets of parents and compare the query counts."""
+        user = user or self.user
+        schema = rebuild_graphql_schema()
+        field = f"rel_{str_to_var_name(rel_key)}"
+        counts = {}
+        data = {}
+        # Warm up per-user permission caches so they don't skew the comparison.
+        self._run(schema, f'query {{ {root_field}(name__ic: "RelBatchWarmup") {{ name }} }}', user)
+        for group in ("Small", "Large"):
+            query = f'query {{ {root_field}(name__ic: "RelBatch{group}") {{ name {field} {{ name }} }} }}'
+            data[group], counts[group] = self._run(schema, query, user)
+        self.assertEqual(len(data["Small"][root_field]), self.SMALL)
+        self.assertEqual(len(data["Large"][root_field]), self.LARGE)
+        self.assertEqual(counts["Small"], counts["Large"], f"Query count grew with number of objects: {counts}")
+        return data
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_many_to_many_source_side(self):
+        data = self._assert_constant_queries("locations", "batch_location_to_vlans")
+        for loc in data["Large"]["locations"]:
+            i = int(loc["name"].rsplit(" ", 1)[1])
+            expected = {f"RelBatchLarge VLAN {i}", f"RelBatchLarge VLAN {(i + 1) % self.LARGE}"}
+            self.assertIsInstance(loc["rel_batch_location_to_vlans"], list)
+            self.assertEqual({v["name"] for v in loc["rel_batch_location_to_vlans"]}, expected)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_many_to_many_destination_side(self):
+        data = self._assert_constant_queries("vlans", "batch_location_to_vlans")
+        for vlan in data["Large"]["vlans"]:
+            i = int(vlan["name"].rsplit(" ", 1)[1])
+            expected = {f"RelBatchLarge Loc {i}", f"RelBatchLarge Loc {(i - 1) % self.LARGE}"}
+            self.assertEqual({v["name"] for v in vlan["rel_batch_location_to_vlans"]}, expected)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_symmetric(self):
+        data = self._assert_constant_queries("vlans", "batch_vlan_peers")
+        for vlan in data["Large"]["vlans"]:
+            i = int(vlan["name"].rsplit(" ", 1)[1])
+            expected = {f"RelBatchLarge VLAN {(i + 1) % self.LARGE}", f"RelBatchLarge VLAN {(i - 1) % self.LARGE}"}
+            self.assertEqual({v["name"] for v in vlan["rel_batch_vlan_peers"]}, expected)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_single_peer_cardinality(self):
+        """The "one" side returns an object, the "many" side a list; missing peers give null."""
+        schema = rebuild_graphql_schema()
+        # Location is source of one-to-many: it has many VLANs; VLAN has a single Location.
+        query = (
+            'query { vlans(name__ic: "RelBatchLarge") { name rel_batch_location_owns_vlan { name } } '
+            'locations(name__ic: "RelBatchLarge") { name rel_batch_location_owns_vlan { name } } }'
+        )
+        data, _ = self._run(schema, query, self.user)
+        for vlan in data["vlans"]:
+            i = int(vlan["name"].rsplit(" ", 1)[1])
+            self.assertEqual(vlan["rel_batch_location_owns_vlan"], {"name": f"RelBatchLarge Loc {i}"})
+        for loc in data["locations"]:
+            self.assertIsInstance(loc["rel_batch_location_owns_vlan"], list)
+            self.assertEqual(len(loc["rel_batch_location_owns_vlan"]), 1)
+        # A VLAN with no association yields null.
+        orphan = VLAN.objects.create(name="RelBatchOrphan VLAN", vid=3999, status=Status.objects.get_for_model(VLAN)[0])
+        data, _ = self._run(
+            schema, 'query { vlans(name__ic: "RelBatchOrphan") { rel_batch_location_owns_vlan { name } } }', self.user
+        )
+        self.assertEqual(data["vlans"], [{"rel_batch_location_owns_vlan": None}])
+        orphan.delete()
+
+    def test_constrained_user_sees_only_permitted_peers_without_n_plus_one(self):
+        self._grant_view(self.user, Location)
+        self._grant_view(self.user, VLAN, {"name__regex": r"VLAN (0|2|4|6|8|10)$"})
+        data = self._assert_constant_queries("locations", "batch_location_to_vlans")
+        for loc in data["Large"]["locations"]:
+            i = int(loc["name"].rsplit(" ", 1)[1])
+            expected = {f"RelBatchLarge VLAN {n}" for n in (i, (i + 1) % self.LARGE) if n % 2 == 0}
+            self.assertEqual({v["name"] for v in loc["rel_batch_location_to_vlans"]}, expected)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_single_object_query_count_unchanged(self):
+        """A single-object query must not bulk-load every association of the relationship."""
+        schema = rebuild_graphql_schema()
+        loc = self.locations["Large"][0]
+        query = f'query {{ location(id: "{loc.pk}") {{ rel_batch_location_to_vlans {{ name }} }} }}'
+        data, count = self._run(schema, query, self.user)
+        self.assertEqual(len(data["location"]["rel_batch_location_to_vlans"]), 2)
+        # One query for the location, one for associations, one for peers (plus none extra).
+        self.assertLessEqual(count, 3)
 
 
 class GraphQLExtendSchemaType(GraphQLTestCaseBase):
