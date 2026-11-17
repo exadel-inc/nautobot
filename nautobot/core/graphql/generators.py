@@ -39,6 +39,16 @@ def _root_field_key(path):
     return path.key
 
 
+def _is_direct_root_child_path(path):
+    """True when `path` is a field on an object fetched directly by the root list query.
+
+    False for a nested peer field reached through another relationship field (e.g. the inner
+    `rel_x` of `locations(...) { rel_x { rel_x { name } } }`), even though `_root_field_key` returns
+    the same key for both: that inner `rel_x` resolves peers of peers, not members of the root queryset.
+    """
+    return path.prev is not None and path.prev.prev is not None and path.prev.prev.prev is None
+
+
 def _graphql_selection_requests_field(info, field_name):
     """Return True if the immediate selection set of this GraphQL field requests `field_name`."""
     for node in info.field_nodes:
@@ -321,6 +331,8 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         caller then falls back to loading the whole relationship, as before. The queryset was already fully
         fetched by the time any of its rows' fields are being resolved, so reading its pks here costs no query.
         """
+        if not _is_direct_root_child_path(info.path):
+            return None
         root_querysets = getattr(info.context, "_gql_root_querysets", None)
         entry = root_querysets.get((info.operation, _root_field_key(info.path))) if root_querysets else None
         if entry is None or entry[0] is not parent_model:
@@ -339,9 +351,7 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
             parent_pks = requested_parent_pks(parent_model, info)
             if parent_pks is not None:
                 if relationship.symmetric:
-                    associations = associations.filter(
-                        Q(source_id__in=parent_pks) | Q(destination_id__in=parent_pks)
-                    )
+                    associations = associations.filter(Q(source_id__in=parent_pks) | Q(destination_id__in=parent_pks))
                 else:
                     associations = associations.filter(**{f"{side}_id__in": parent_pks})
             for source_id, destination_id in associations.values_list("source_id", "destination_id"):
@@ -373,7 +383,10 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         if cached_operation is not info.operation:
             cache = {}
             info.context._gql_relationship_cache = (info.operation, cache)
-        cache_key = (relationship.pk, side, tuple(id(node) for node in info.field_nodes))
+        # A shared fragment reuses the same field nodes under every root alias that spreads it, so the root
+        # key must be part of the cache key too - otherwise the second alias would reuse the first alias's
+        # root-scoped bulk data (see `requested_parent_pks`) and silently drop its own peers.
+        cache_key = (relationship.pk, side, _root_field_key(info.path), tuple(id(node) for node in info.field_nodes))
 
         if cache_key not in cache:
             cache[cache_key] = None  # seen once; the bulk data is only loaded if there's a second parent

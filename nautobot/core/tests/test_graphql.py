@@ -969,16 +969,91 @@ class GraphQLRelationshipQueryCountTest(GraphQLTestCaseBase):
 
         # The bulk lookup selects both columns straight off the association table (unlike the single-parent
         # path's per-object subquery, which selects only one column and is embedded inside the peer query).
+        destination_id = connection.ops.quote_name("destination_id")
+        association_table = connection.ops.quote_name("extras_relationshipassociation")
         bulk_queries = [
-            q["sql"]
-            for q in ctx.captured_queries
-            if 'AS "destination_id" FROM "extras_relationshipassociation"' in q["sql"]
+            q["sql"] for q in ctx.captured_queries if f"AS {destination_id} FROM {association_table}" in q["sql"]
         ]
         self.assertTrue(bulk_queries, "Expected to find the bulk association lookup query")
         for sql in bulk_queries:
             self.assertIn("IN (", sql)
             for loc in unrelated_locations:
                 self.assertNotIn(str(loc.pk), sql)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_nested_relationship_of_same_model_not_scoped_to_outer_root(self):
+        """A relationship nested inside another occurrence of itself must resolve its own peers, not the outer root's."""
+        location_type = LocationType.objects.get(name="Campus")
+        location_status = Status.objects.get_for_model(Location)[0]
+        self_ref = Relationship.objects.create(
+            label="Batch Nested Self Ref",
+            key="batch_nested_self_ref",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(Location),
+            type="many-to-many",
+        )
+        names = [
+            "RelNestedRoot A",
+            "RelNestedRoot B",
+            "RelNestedPeer A1",
+            "RelNestedPeer B1",
+            "RelNestedLeaf A2",
+            "RelNestedLeaf B2",
+        ]
+        root_a, root_b, peer_a1, peer_b1, leaf_a2, leaf_b2 = (
+            Location.objects.create(name=name, location_type=location_type, status=location_status) for name in names
+        )
+        # Each root has exactly one peer, and each of those peers has exactly one peer of their own (a different
+        # object than either root). If the inner field were wrongly scoped to the outer roots, it would miss these.
+        RelationshipAssociation.objects.create(relationship=self_ref, source=root_a, destination=peer_a1)
+        RelationshipAssociation.objects.create(relationship=self_ref, source=root_b, destination=peer_b1)
+        RelationshipAssociation.objects.create(relationship=self_ref, source=peer_a1, destination=leaf_a2)
+        RelationshipAssociation.objects.create(relationship=self_ref, source=peer_b1, destination=leaf_b2)
+
+        schema = rebuild_graphql_schema()
+        # Filtered to match only the two roots: a broader filter matching the peers/leaves too would let the
+        # root-scoped bulk query incidentally include them, masking the bug this test is meant to catch.
+        query = (
+            'query { locations(name__ic: "RelNestedRoot") { name rel_batch_nested_self_ref_destination '
+            "{ name rel_batch_nested_self_ref_destination { name } } } }"
+        )
+        data, _ = self._run(schema, query, self.user)
+        by_name = {loc["name"]: loc for loc in data["locations"]}
+        self.assertEqual(
+            {p["name"] for p in by_name["RelNestedRoot A"]["rel_batch_nested_self_ref_destination"]},
+            {"RelNestedPeer A1"},
+        )
+        self.assertEqual(
+            {p["name"] for p in by_name["RelNestedRoot B"]["rel_batch_nested_self_ref_destination"]},
+            {"RelNestedPeer B1"},
+        )
+        nested_a = by_name["RelNestedRoot A"]["rel_batch_nested_self_ref_destination"][0]
+        nested_b = by_name["RelNestedRoot B"]["rel_batch_nested_self_ref_destination"][0]
+        self.assertEqual({p["name"] for p in nested_a["rel_batch_nested_self_ref_destination"]}, {"RelNestedLeaf A2"})
+        self.assertEqual({p["name"] for p in nested_b["rel_batch_nested_self_ref_destination"]}, {"RelNestedLeaf B2"})
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_shared_fragment_across_root_aliases_does_not_cross_contaminate_cache(self):
+        """A relationship field reached via a shared fragment under two root aliases must not share cached data."""
+        schema = rebuild_graphql_schema()
+        query = """
+        query {
+            a: locations(name__ic: "RelBatchSmall") { ...RelFrag }
+            b: locations(name__ic: "RelBatchLarge") { ...RelFrag }
+        }
+        fragment RelFrag on LocationType {
+            name
+            rel_batch_location_to_vlans { name }
+        }
+        """
+        data, _ = self._run(schema, query, self.user)
+        self.assertEqual(len(data["a"]), self.SMALL)
+        self.assertEqual(len(data["b"]), self.LARGE)
+        for loc in data["b"]:
+            i = int(loc["name"].rsplit(" ", 1)[1])
+            expected = {f"RelBatchLarge VLAN {i}", f"RelBatchLarge VLAN {(i + 1) % self.LARGE}"}
+            self.assertEqual({v["name"] for v in loc["rel_batch_location_to_vlans"]}, expected)
+
 
 class GraphQLExtendSchemaType(GraphQLTestCaseBase):
     def setUp(self):
