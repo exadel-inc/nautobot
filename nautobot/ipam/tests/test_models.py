@@ -2134,6 +2134,48 @@ class TestIPAddress(ModelTestCases.BaseModelTestCase):
         self.status = Status.objects.get(name="Active")
         self.prefix = Prefix.objects.create(prefix="192.0.2.0/24", status=self.status, namespace=self.namespace)
 
+    def _full_clean_with_dns_name(self, dns_name):
+        ip_address = IPAddress(address="192.0.2.1/24", status=self.status, namespace=self.namespace, dns_name=dns_name)
+        ip_address.full_clean()
+
+    def test_dns_name_invalid(self):
+        """Names that break RFC 1123 label or length rules are rejected."""
+        invalid_names = [
+            "whatever-.your.tld",
+            "-host.example.com",
+            "host.-sub.example.com",
+            "a..b",
+            ".example.com",
+            ".",
+            "a" * 64 + ".example.com",
+            ".".join(["a" * 60] * 5),  # 304 characters
+            ".".join(["a" * 63] * 3 + ["a" * 62]),  # 254 characters
+        ]
+        for dns_name in invalid_names:
+            with self.subTest(dns_name=dns_name):
+                with self.assertRaises(ValidationError) as cm:
+                    self._full_clean_with_dns_name(dns_name)
+                self.assertIn("dns_name", cm.exception.message_dict)
+
+    def test_dns_name_valid(self):
+        """Hostnames following RFC 1123 (plus underscores) and the empty string are accepted."""
+        valid_names = [
+            "host.example.com",
+            "host.example.com.",
+            "example",
+            "example_1",
+            "ipaddress-a",
+            "1host.example.com",
+            "xn--bcher-kva.example",
+            "a" * 63,
+            ".".join(["a" * 63] * 3 + ["a" * 61]),  # 253 characters
+            ".".join(["a" * 63] * 3 + ["a" * 61]) + ".",
+            "",
+        ]
+        for dns_name in valid_names:
+            with self.subTest(dns_name=dns_name):
+                self._full_clean_with_dns_name(dns_name)
+
     def test_get_or_create(self):
         """Assert `get_or_create` method to permit specifying a namespace as an alternative to a parent prefix."""
         default_namespace = get_default_namespace()

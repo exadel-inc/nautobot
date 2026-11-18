@@ -23,8 +23,18 @@ class MinPrefixLengthValidator(BaseValidator):
         return a.prefixlen < b
 
 
+# RFC 1123 hostname rules, with underscores also allowed (used by e.g. AD/Windows hosts):
+# - the lookahead caps the name at 253 characters, not counting an optional trailing root dot
+# - each label is 1-63 characters and may not start or end with a hyphen
 DNSValidator = RegexValidator(
-    regex="^[0-9A-Za-z._-]+$",
-    message="Only alphanumeric characters, hyphens, periods, and underscores are allowed in DNS names",
+    regex=(
+        r"^(?=.{1,253}\.?$)"
+        r"[0-9A-Za-z_](?:[0-9A-Za-z_-]{0,61}[0-9A-Za-z_])?"
+        r"(?:\.[0-9A-Za-z_](?:[0-9A-Za-z_-]{0,61}[0-9A-Za-z_])?)*\.?$"
+    ),
+    message=(
+        "DNS names must consist of period-separated labels of 1-63 alphanumeric characters, hyphens, or "
+        "underscores; labels may not begin or end with a hyphen, and the whole name may be at most 253 characters"
+    ),
     code="invalid",
 )
