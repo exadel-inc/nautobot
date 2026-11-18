@@ -1115,6 +1115,7 @@ class JobResult(SavedViewMixin, BaseModel, CustomFieldModel):
                 name=job_model.name,
                 job_model=job_model,
                 scheduled_job=schedule,
+                task_name=job_model.class_path,
                 user=user,
             )
         else:
@@ -1138,6 +1139,9 @@ class JobResult(SavedViewMixin, BaseModel, CustomFieldModel):
             celery_kwargs=celery_kwargs,
         )
         job_result.celery_kwargs = job_celery_kwargs
+        if not job_result.task_name:
+            # Celery's result backend sets this later, but a Kubernetes pod never goes through it.
+            job_result.task_name = job_model.class_path
         job_result.save()
         job_result.refresh_from_db()
 
@@ -1182,6 +1186,9 @@ class JobResult(SavedViewMixin, BaseModel, CustomFieldModel):
                 signal.alarm(0)
 
             job_result.refresh_from_db()
+            if not job_result.task_name:
+                # The eager run's result backend write can reset task_name.
+                job_result.task_name = job_model.class_path
             cls._sync_eager_result_to_job_result(job_result, eager_result)
 
         else:

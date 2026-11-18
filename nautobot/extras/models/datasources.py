@@ -165,13 +165,17 @@ class GitRepository(PrimaryModel):
         """
         from nautobot.extras.models import JobResult
 
-        # This will match all "GitRepository" jobs (pull/refresh, dry-run, etc.)
-        prefix = "nautobot.core.jobs.GitRepository"
-
-        if JobResult.objects.filter(task_name__startswith=prefix, task_kwargs__repository=self.pk).exists():
-            return JobResult.objects.filter(task_name__startswith=prefix, task_kwargs__repository=self.pk).latest()
-        else:
-            return None
+        # This will match all "GitRepository" jobs (pull/refresh, dry-run, etc.).
+        # Results created before task_name was set at enqueue time (Kubernetes) are matched via job_model instead.
+        is_git_repository_job = models.Q(task_name__startswith="nautobot.core.jobs.GitRepository") | models.Q(
+            job_model__module_name="nautobot.core.jobs",
+            job_model__job_class_name__startswith="GitRepository",
+        )
+        return (
+            JobResult.objects.filter(is_git_repository_job, task_kwargs__repository=self.pk)
+            .order_by("-date_created")
+            .first()
+        )
 
     def to_csv(self):
         return (

@@ -2113,6 +2113,55 @@ class JobResultEnqueueJobCase(TransactionTestCase):
                 actual_job_result_arg = call_args[0][0]  # first positional arg
                 self.assertEqual(actual_job_result_arg.celery_kwargs.get("nautobot_job_console_log"), console_log)
 
+    @mock.patch("nautobot.extras.models.jobs.run_kubernetes_job_and_return_job_result")
+    def test_kubernetes_queue_sets_task_name_before_pod_runs(self, mock_kubernetes_job):
+        kubernetes_queue = JobQueue.objects.create(
+            name="Task Name Kubernetes Queue",
+            queue_type=JobQueueTypeChoices.TYPE_KUBERNETES,
+        )
+        mock_kubernetes_job.side_effect = lambda job_result, job_kwargs: job_result
+
+        job_result = JobResult.enqueue_job(
+            job_model=self.job_model,
+            user=self.user,
+            job_queue=kubernetes_queue,
+            job_kwargs={"foo": "bar"},
+        )
+
+        mock_kubernetes_job.assert_called_once()
+        self.assertEqual(job_result.task_name, self.job_model.class_path)
+        self.assertEqual(JobResult.objects.get(pk=job_result.pk).task_name, self.job_model.class_path)
+
+    @mock.patch("nautobot.extras.models.jobs.run_kubernetes_job_and_return_job_result")
+    def test_existing_job_result_without_task_name_gets_task_name(self, mock_kubernetes_job):
+        kubernetes_queue = JobQueue.objects.create(
+            name="Existing Result Kubernetes Queue",
+            queue_type=JobQueueTypeChoices.TYPE_KUBERNETES,
+        )
+        mock_kubernetes_job.side_effect = lambda job_result, job_kwargs: job_result
+        existing = JobResult.objects.create(name=self.job_model.name, job_model=self.job_model, user=self.user)
+        self.assertIsNone(existing.task_name)
+
+        job_result = JobResult.enqueue_job(
+            job_model=self.job_model,
+            user=self.user,
+            job_queue=kubernetes_queue,
+            job_result=existing,
+            job_kwargs={"foo": "bar"},
+        )
+
+        self.assertEqual(job_result.task_name, self.job_model.class_path)
+
+    def test_synchronous_enqueue_task_name(self):
+        job_result = JobResult.enqueue_job(
+            job_model=self.job_model,
+            user=self.user,
+            synchronous=True,
+            job_kwargs={},
+        )
+
+        self.assertEqual(job_result.task_name, self.job_model.class_path)
+
 
 class RunConsoleLogJobTestCase(CelerySubprocessTestCase):
     """Test run_console_log_job_and_return_job_result E2E"""

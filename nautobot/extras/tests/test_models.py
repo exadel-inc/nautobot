@@ -1890,6 +1890,37 @@ class GitRepositoryTest(ModelTestCases.BaseModelTestCase):
     def test_filesystem_path(self):
         self.assertEqual(self.repo.filesystem_path, os.path.join(settings.GIT_ROOT, self.repo.slug))
 
+    def test_get_latest_sync(self):
+        """get_latest_sync() finds sync/dry-run results by task_name, or by job_model for legacy task_name=None rows."""
+        self.assertIsNone(self.repo.get_latest_sync())
+
+        sync_job = JobModel.objects.get(module_name="nautobot.core.jobs", job_class_name="GitRepositorySync")
+        dry_run_job = JobModel.objects.get(module_name="nautobot.core.jobs", job_class_name="GitRepositoryDryRun")
+        user = User.objects.create_user(username="git-sync-user")
+        kwargs = {"repository": str(self.repo.pk)}
+
+        # Legacy Kubernetes row: no task_name was ever recorded.
+        legacy = JobResult.objects.create(name=sync_job.name, job_model=sync_job, user=user, task_kwargs=kwargs)
+        self.assertIsNone(legacy.task_name)
+        self.assertEqual(self.repo.get_latest_sync(), legacy)
+
+        # A newer dry-run result with a task_name wins.
+        newest = JobResult.objects.create(
+            name=dry_run_job.name,
+            job_model=dry_run_job,
+            user=user,
+            task_name=dry_run_job.class_path,
+            task_kwargs=kwargs,
+        )
+        self.assertEqual(self.repo.get_latest_sync(), newest)
+
+        # Results for another repository or an unrelated job are ignored.
+        other_kwargs = {"repository": str(uuid.uuid4())}
+        JobResult.objects.create(name=sync_job.name, job_model=sync_job, user=user, task_kwargs=other_kwargs)
+        unrelated = JobModel.objects.exclude(module_name="nautobot.core.jobs").first()
+        JobResult.objects.create(name=unrelated.name, job_model=unrelated, user=user, task_kwargs=kwargs)
+        self.assertEqual(self.repo.get_latest_sync(), newest)
+
     def test_slug_no_change(self):
         """Confirm that a slug cannot be changed after creation."""
         self.repo.slug = "a_different_slug"
