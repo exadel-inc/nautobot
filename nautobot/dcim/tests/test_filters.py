@@ -6,7 +6,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.db.models import F, Q
 
 from nautobot.circuits.models import Circuit, CircuitTermination, CircuitType, Provider
-from nautobot.core.testing import FilterTestCases
+from nautobot.core.testing import FilterTestCases, TestCase
 from nautobot.dcim.choices import (
     CableLengthUnitChoices,
     CableTypeChoices,
@@ -5037,3 +5037,161 @@ class InterfaceConnectionFilterSetTestCase(_ConnectionFilterSetTestMixin, Filter
         unfiltered_count = self.queryset.count()
         result = self.filterset({"location": "   "}, self.queryset).qs
         self.assertEqual(result.count(), unfiltered_count)
+
+
+class HierarchicalLocationFilterTestCase(TestCase):
+    """GH#9709: `location` filters match devices in descendant locations, like `DeviceFilterSet` does."""
+
+    @classmethod
+    def setUpTestData(cls):
+        location_type = LocationType.objects.create(name="Hierarchical Filter Type", nestable=True)
+        location_type.content_types.add(ContentType.objects.get_for_model(Device))
+        location_status = Status.objects.get_for_model(Location).first()
+        cls.parent = Location.objects.create(name="HLF Parent", location_type=location_type, status=location_status)
+        cls.child = Location.objects.create(
+            name="HLF Child", location_type=location_type, parent=cls.parent, status=location_status
+        )
+        cls.grandchild = Location.objects.create(
+            name="HLF Grandchild", location_type=location_type, parent=cls.child, status=location_status
+        )
+        cls.other = Location.objects.create(name="HLF Other", location_type=location_type, status=location_status)
+
+        device_type = DeviceType.objects.create(manufacturer=Manufacturer.objects.first(), model="HLF Device Type")
+        role = Role.objects.get_for_model(Device).first()
+        device_status = Status.objects.get_for_model(Device).first()
+        cls.devices = {
+            location.name: Device.objects.create(
+                name=f"{location.name} Device",
+                device_type=device_type,
+                role=role,
+                location=location,
+                status=device_status,
+            )
+            for location in (cls.parent, cls.child, cls.grandchild, cls.other)
+        }
+
+    def assertFilteredPks(self, filterset_class, queryset, params, expected):
+        actual = set(filterset_class(params, queryset).qs.values_list("pk", flat=True))
+        self.assertEqual(actual, {obj.pk for obj in expected})
+
+    def test_inventory_item_location_includes_descendants(self):
+        items = {name: InventoryItem.objects.create(device=device, name=name) for name, device in self.devices.items()}
+        queryset = InventoryItem.objects.filter(pk__in=[item.pk for item in items.values()])
+        descendants = [items["HLF Parent"], items["HLF Child"], items["HLF Grandchild"]]
+        for value in (self.parent.name, str(self.parent.pk)):
+            with self.subTest(value=value):
+                self.assertFilteredPks(InventoryItemFilterSet, queryset, {"location": [value]}, descendants)
+        with self.subTest("leaf"):
+            self.assertFilteredPks(
+                InventoryItemFilterSet, queryset, {"location": [self.grandchild.name]}, [items["HLF Grandchild"]]
+            )
+
+    def test_device_component_location_includes_descendants(self):
+        interface_status = Status.objects.get_for_model(Interface).first()
+        interfaces = {
+            name: Interface.objects.create(device=device, name="eth0", status=interface_status, type="1000base-t")
+            for name, device in self.devices.items()
+        }
+        console_ports = {
+            name: ConsolePort.objects.create(device=device, name="con0") for name, device in self.devices.items()
+        }
+        for filterset_class, components in ((InterfaceFilterSet, interfaces), (ConsolePortFilterSet, console_ports)):
+            queryset = filterset_class.Meta.model.objects.filter(pk__in=[c.pk for c in components.values()])
+            with self.subTest(filterset=filterset_class.__name__, filter="parent"):
+                self.assertFilteredPks(
+                    filterset_class,
+                    queryset,
+                    {"location": [self.parent.name]},
+                    [components["HLF Parent"], components["HLF Child"], components["HLF Grandchild"]],
+                )
+            with self.subTest(filterset=filterset_class.__name__, filter="leaf"):
+                self.assertFilteredPks(
+                    filterset_class, queryset, {"location": [self.other.pk]}, [components["HLF Other"]]
+                )
+
+    def test_virtual_chassis_location_includes_descendants(self):
+        chassis = {}
+        for name, device in self.devices.items():
+            chassis[name] = VirtualChassis.objects.create(name=f"{name} VC", master=device)
+            device.virtual_chassis = chassis[name]
+            device.vc_position = 1
+            device.save()
+        queryset = VirtualChassis.objects.filter(pk__in=[vc.pk for vc in chassis.values()])
+        for value in (self.parent.name, str(self.parent.pk)):
+            with self.subTest(value=value):
+                self.assertFilteredPks(
+                    VirtualChassisFilterSet,
+                    queryset,
+                    {"location": [value]},
+                    [chassis["HLF Parent"], chassis["HLF Child"], chassis["HLF Grandchild"]],
+                )
+        with self.subTest("leaf"):
+            self.assertFilteredPks(
+                VirtualChassisFilterSet, queryset, {"location": [self.other.pk]}, [chassis["HLF Other"]]
+            )
+
+    def _assert_connection_location_filter(self, filterset_class, queryset, expected_for_parent, expected_for_leaf):
+        with self.subTest("parent name includes descendants"):
+            self.assertFilteredPks(filterset_class, queryset, {"location": self.parent.name}, expected_for_parent)
+        with self.subTest("leaf name"):
+            self.assertFilteredPks(filterset_class, queryset, {"location": self.other.name}, expected_for_leaf)
+        with self.subTest("whitespace is unfiltered"):
+            self.assertFilteredPks(filterset_class, queryset, {"location": "   "}, queryset)
+        with self.subTest("unknown name matches nothing"):
+            self.assertFilteredPks(filterset_class, queryset, {"location": "HLF No Such Location"}, [])
+
+    def test_console_connection_location_includes_descendants(self):
+        cable_status = Status.objects.get_for_model(Cable).get(name="Connected")
+        ports = {}
+        for name, device in self.devices.items():
+            ports[name] = ConsolePort.objects.create(device=device, name="con0")
+            Cable.objects.create(
+                termination_a=ports[name],
+                termination_b=ConsoleServerPort.objects.create(device=device, name="csp0"),
+                status=cable_status,
+            )
+        queryset = ConsolePort.objects.filter(pk__in=[p.pk for p in ports.values()], cable_paths__isnull=False)
+        self._assert_connection_location_filter(
+            ConsoleConnectionFilterSet,
+            queryset,
+            [ports["HLF Parent"], ports["HLF Child"], ports["HLF Grandchild"]],
+            [ports["HLF Other"]],
+        )
+
+    def test_power_connection_location_includes_descendants(self):
+        cable_status = Status.objects.get_for_model(Cable).get(name="Connected")
+        ports = {}
+        for name, device in self.devices.items():
+            ports[name] = PowerPort.objects.create(device=device, name="pp0")
+            Cable.objects.create(
+                termination_a=ports[name],
+                termination_b=PowerOutlet.objects.create(device=device, name="po0"),
+                status=cable_status,
+            )
+        queryset = PowerPort.objects.filter(pk__in=[p.pk for p in ports.values()], cable_paths__isnull=False)
+        self._assert_connection_location_filter(
+            PowerConnectionFilterSet,
+            queryset,
+            [ports["HLF Parent"], ports["HLF Child"], ports["HLF Grandchild"]],
+            [ports["HLF Other"]],
+        )
+
+    def test_interface_connection_location_includes_descendants(self):
+        interface_status = Status.objects.get_for_model(Interface).first()
+        cable_status = Status.objects.get_for_model(Cable).get(name="Connected")
+        paths = {}
+        for name, device in self.devices.items():
+            # Each device is cabled to its own second interface so every connection is local to one location.
+            a, b = (
+                Interface.objects.create(device=device, name=n, status=interface_status, type="1000base-t")
+                for n in ("eth0", "eth1")
+            )
+            Cable.objects.create(termination_a=a, termination_b=b, status=cable_status)
+            paths[name] = CablePath.objects.get(origin_id=a.pk, destination_id=b.pk)
+        queryset = CablePath.objects.filter(pk__in=[p.pk for p in paths.values()])
+        self._assert_connection_location_filter(
+            InterfaceConnectionFilterSet,
+            queryset,
+            [paths["HLF Parent"], paths["HLF Child"], paths["HLF Grandchild"]],
+            [paths["HLF Other"]],
+        )
