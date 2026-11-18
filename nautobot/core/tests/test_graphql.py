@@ -490,9 +490,11 @@ class GraphQLRelatedObjectPermissionTest(GraphQLTestCaseBase):
 
     def test_relationship_traversal_enforces_permissions_for_many_parents(self):
         """Resolving a Relationship for several parents (the bulk path) must still hide peers the user cannot view."""
-        status = Status.objects.get_for_model(Location)[0]
+        location_status = Status.objects.get_for_model(Location)[0]
         extra_locations = [
-            Location.objects.create(name=f"Perm Extra Location {i}", location_type=self.location_type, status=status)
+            Location.objects.create(
+                name=f"Perm Extra Location {i}", location_type=self.location_type, status=location_status
+            )
             for i in range(2)
         ]
         vlan_status = Status.objects.get_for_model(VLAN)[0]
@@ -528,9 +530,9 @@ class GraphQLRelatedObjectPermissionTest(GraphQLTestCaseBase):
 
     def test_single_peer_relationship_enforces_permissions_for_many_parents(self):
         """The single-peer side of a one-to-many Relationship returns null when its peer is not viewable."""
-        status = Status.objects.get_for_model(Location)[0]
+        location_status = Status.objects.get_for_model(Location)[0]
         hidden_location = Location.objects.create(
-            name="Perm Hidden Location", location_type=self.location_type, status=status
+            name="Perm Hidden Location", location_type=self.location_type, status=location_status
         )
         vlan_status = Status.objects.get_for_model(VLAN)[0]
         relationship = Relationship.objects.create(
