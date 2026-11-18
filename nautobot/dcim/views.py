@@ -2268,12 +2268,16 @@ class ComponentCreateViewMixin(ObjectEditViewMixin):
                     return parent.name if attr == "virtual_machine" else parent.display
         return ""
 
-    def get_component_model_form(self, request, data=None):
-        """Return the per-instance component model form used to validate/save each expanded child."""
-        return self.form_class(  # pylint: disable=not-callable
-            data or None,
-            initial=normalize_querydict(request.GET, form_class=self.form_class),
-        )
+    def get_component_model_form(self, request, data=None, use_query_initial=True):
+        """
+        Return the per-instance component model form used to validate/save each expanded child.
+
+        Pass `use_query_initial=False` when `data` is already validated: a query-string `initial` such as
+        `?device=<pk>` would make `ModularComponentEditForm` disable the `device` and `module` fields,
+        discarding the submitted module.
+        """
+        initial = normalize_querydict(request.GET, form_class=self.form_class) if use_query_initial else None
+        return self.form_class(data or None, initial=initial)  # pylint: disable=not-callable
 
     def create(self, request, *args, **kwargs):
         """
@@ -2318,7 +2322,7 @@ class ComponentCreateViewMixin(ObjectEditViewMixin):
                 data.update(create_form.get_iterative_data(i))
 
             # Recreate the form for each iteration with updated data
-            component_form = self.get_component_model_form(request, data=data)
+            component_form = self.get_component_model_form(request, data=data, use_query_initial=False)
             if component_form.is_valid():
                 new_components.append(component_form)
             else:

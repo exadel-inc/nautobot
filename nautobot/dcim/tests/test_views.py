@@ -3696,6 +3696,35 @@ class ConsolePortTestCase(ViewTestCases.DeviceComponentViewTestCase):
             "description": "new test description",
         }
 
+    def test_create_console_port_with_module_when_opened_with_device_query_param(self):
+        """The Module selected on the add form is kept when the form was opened with `?device=<pk>`."""
+        self.add_permissions("dcim.add_consoleport", "dcim.view_module")
+        device = Device.objects.first()
+        module_bay = ModuleBay.objects.create(parent_device=device, name="Device Query Console Bay", position="1")
+        module = Module.objects.create(
+            module_type=ModuleType.objects.create(
+                manufacturer=Manufacturer.objects.first(), model="Device Query Console Module Type"
+            ),
+            parent_module_bay=module_bay,
+            status=Status.objects.get_for_model(Module).first(),
+        )
+
+        request = {
+            "path": f"{self._get_url('add')}?device={device.pk}",
+            "data": post_data(
+                {
+                    "device": device.pk,
+                    "module": module.pk,
+                    "name_pattern": "Device Query Console Port 1",
+                    "type": ConsolePortTypeChoices.TYPE_RJ45,
+                }
+            ),
+        }
+        self.assertHttpStatus(self.client.post(**request), 302)
+        console_port = ConsolePort.objects.get(name="Device Query Console Port 1")
+        self.assertEqual(console_port.module, module)
+        self.assertEqual(console_port.device, device)
+
     def test_get_selected_objects_parents_name_empty(self):
         """Covers the empty-queryset branch (`return ""`) in get_selected_objects_parents_name."""
         viewset = ConsolePortUIViewSet()
@@ -4263,6 +4292,36 @@ class InterfaceTestCase(ViewTestCases.DeviceComponentViewTestCase):
         # `ModularComponentModel.save()` backfills the device from the module's parent module bay
         self.assertEqual(interface.device, device)
         self.assertEqual(list(interface.tagged_vlans.all()), [vlan])
+
+    def test_create_interface_with_module_when_opened_with_device_query_param(self):
+        """The Module selected on the add form is kept when the form was opened with `?device=<pk>`."""
+        self.add_permissions("dcim.add_interface", "dcim.view_module", "extras.view_status")
+        device = Device.objects.first()
+        module_bay = ModuleBay.objects.create(parent_device=device, name="Device Query Interface Bay", position="1")
+        module = Module.objects.create(
+            module_type=ModuleType.objects.create(
+                manufacturer=Manufacturer.objects.first(), model="Device Query Interface Module Type"
+            ),
+            parent_module_bay=module_bay,
+            status=Status.objects.get_for_model(Module).first(),
+        )
+
+        request = {
+            "path": f"{self._get_url('add')}?device={device.pk}",
+            "data": post_data(
+                {
+                    "device": device.pk,
+                    "module": module.pk,
+                    "name_pattern": "Device Query Interface 1",
+                    "status": Status.objects.get_for_model(Interface).first().pk,
+                    "type": InterfaceTypeChoices.TYPE_1GE_FIXED,
+                }
+            ),
+        }
+        self.assertHttpStatus(self.client.post(**request), 302)
+        interface = Interface.objects.get(name="Device Query Interface 1")
+        self.assertEqual(interface.module, module)
+        self.assertEqual(interface.device, device)
 
     def test_create_interface_without_device_or_module_reports_error(self):
         """An interface belonging to neither a device nor a module is rejected rather than raising an exception."""
