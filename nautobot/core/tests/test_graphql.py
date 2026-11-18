@@ -488,6 +488,86 @@ class GraphQLRelatedObjectPermissionTest(GraphQLTestCaseBase):
         vlan_names = sorted(vlan["name"] for vlan in result.data["locations"][0][self.rel_field_name])
         self.assertEqual(vlan_names, ["Visible VLAN"])
 
+    def test_relationship_traversal_enforces_permissions_for_many_parents(self):
+        """Resolving a Relationship for several parents (the bulk path) must still hide peers the user cannot view."""
+        status = Status.objects.get_for_model(Location)[0]
+        extra_locations = [
+            Location.objects.create(name=f"Perm Extra Location {i}", location_type=self.location_type, status=status)
+            for i in range(2)
+        ]
+        vlan_status = Status.objects.get_for_model(VLAN)[0]
+        for index, location in enumerate(extra_locations):
+            for name, vid in (
+                (f"Visible VLAN extra {index}", 3410 + index),
+                (f"Hidden VLAN extra {index}", 3420 + index),
+            ):
+                vlan = VLAN.objects.create(name=name, vid=vid, status=vlan_status)
+                RelationshipAssociation.objects.create(
+                    relationship=self.relationship, source=location, destination=vlan
+                )
+        self._grant_view(self.user, Location)
+        self._grant_view(self.user, VLAN, {"name__startswith": "Visible VLAN"})
+
+        query = f"""
+        query {{
+            locations(name__ic: "Perm") {{
+                name
+                {self.rel_field_name} {{
+                    name
+                }}
+            }}
+        }}
+        """
+        result = execute_query_on_rebuilt_schema(query, user=self.user)
+        self.assertIsNone(result.errors)
+        self.assertEqual(len(result.data["locations"]), 3)
+        for location in result.data["locations"]:
+            vlan_names = [vlan["name"] for vlan in location[self.rel_field_name]]
+            self.assertEqual(len(vlan_names), 1, location)
+            self.assertTrue(vlan_names[0].startswith("Visible VLAN"), location)
+
+    def test_single_peer_relationship_enforces_permissions_for_many_parents(self):
+        """The single-peer side of a one-to-many Relationship returns null when its peer is not viewable."""
+        status = Status.objects.get_for_model(Location)[0]
+        hidden_location = Location.objects.create(
+            name="Perm Hidden Location", location_type=self.location_type, status=status
+        )
+        vlan_status = Status.objects.get_for_model(VLAN)[0]
+        relationship = Relationship.objects.create(
+            label="Perm Location to many VLANs",
+            key="perm_location_to_many_vlans",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(VLAN),
+            type="one-to-many",
+        )
+        vlans = {}
+        for index, location in enumerate((self.location, hidden_location)):
+            vlans[location.name] = VLAN.objects.create(
+                name=f"Perm Owned VLAN {index}", vid=3430 + index, status=vlan_status
+            )
+            RelationshipAssociation.objects.create(
+                relationship=relationship, source=location, destination=vlans[location.name]
+            )
+        self._grant_view(self.user, VLAN, {"name__startswith": "Perm Owned VLAN"})
+        self._grant_view(self.user, Location, {"name": "Perm Test Location"})
+
+        field = f"rel_{str_to_var_name(relationship.key)}"
+        query = f"""
+        query {{
+            vlans(name__ic: "Perm Owned VLAN") {{
+                name
+                {field} {{
+                    name
+                }}
+            }}
+        }}
+        """
+        result = execute_query_on_rebuilt_schema(query, user=self.user)
+        self.assertIsNone(result.errors)
+        owners = {vlan["name"]: vlan[field] for vlan in result.data["vlans"]}
+        self.assertEqual(owners["Perm Owned VLAN 0"], {"name": "Perm Test Location"})
+        self.assertIsNone(owners["Perm Owned VLAN 1"])
+
     def test_fk_traversal_enforces_related_model_permissions(self):
         """Forward FK traversal must respect view permissions on the related model."""
         # The user may view the rack, but is granted NO permission to view its location.
@@ -856,6 +936,24 @@ class GraphQLRelationshipQueryCountTest(GraphQLTestCaseBase):
         query = f'query {{ vlans(name: "{assoc.destination.name}") {{ {one_to_one} {{ name }} }} }}'
         result = execute_query_on_rebuilt_schema(query, user=self.user)
         self.assertEqual(result.data["vlans"][0][one_to_one]["name"], locations[0].name)
+
+    def test_same_relationship_with_different_selections(self):
+        """The same relationship selected twice with different sub-fields returns each selection's fields."""
+        locations = self._populate(3)
+        field = self._field(self.relationships["many-to-many"])
+        query = f"""
+        query {{
+            first: locations(name__ic: "Count Location") {{ {field} {{ name }} }}
+            second: locations(name__ic: "Count Location") {{ {field} {{ vid }} }}
+        }}
+        """
+        result = execute_query_on_rebuilt_schema(query, user=self.user)
+        self.assertIsNone(result.errors)
+        self.assertEqual(len(result.data["first"]), len(locations))
+        for first, second in zip(result.data["first"], result.data["second"]):
+            self.assertEqual(len(first[field]), len(second[field]))
+            self.assertTrue(all("name" in peer for peer in first[field]))
+            self.assertTrue(all("vid" in peer for peer in second[field]))
 
 
 class GraphQLExtendSchemaType(GraphQLTestCaseBase):

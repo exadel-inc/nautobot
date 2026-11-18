@@ -3,6 +3,7 @@
 import logging
 
 from django.core.exceptions import ObjectDoesNotExist
+from django.db.models import Q
 import graphene
 import graphene_django_optimizer as gql_optimizer
 from graphql import GraphQLError
@@ -264,15 +265,17 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
             directions = [(side, peer_side)]
 
         peer_ids_by_parent = {}
+        peer_filter = Q()
         for own, peer in directions:
             direction_associations = associations
             if parent_ids is not None:
                 direction_associations = associations.filter(**{f"{own}_id__in": parent_ids})
             for own_id, peer_id in direction_associations.values_list(f"{own}_id", f"{peer}_id"):
                 peer_ids_by_parent.setdefault(own_id, set()).add(peer_id)
+            # Select peers with a subquery so the database does the join instead of receiving a long list of IDs.
+            peer_filter |= Q(id__in=direction_associations.values(f"{peer}_id"))
 
-        all_peer_ids = set().union(*peer_ids_by_parent.values())
-        peer_queryset = peer_model.objects.filter(id__in=all_peer_ids)
+        peer_queryset = peer_model.objects.filter(peer_filter) if peer_ids_by_parent else peer_model.objects.none()
         if hasattr(peer_queryset, "restrict"):
             peer_queryset = peer_queryset.restrict(info.context.user, "view")
         # Fetching the peers in one queryset keeps the model's default ordering for each parent's list.
@@ -292,7 +295,16 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         if not hasattr(info.context, "_gql_relationship_cache"):
             info.context._gql_relationship_cache = {}
         cache = info.context._gql_relationship_cache
-        cache_key = (relationship.pk, side)
+        # Peers are loaded with `only()`/`select_related()` for this field's selection set, so the key includes the
+        # field's path (without list indices): the same relationship selected with different sub-fields elsewhere in
+        # the query gets its own load rather than reusing peers with the wrong fields deferred.
+        field_path = []
+        path = info.path
+        while path is not None:
+            if isinstance(path.key, str):
+                field_path.append(path.key)
+            path = path.prev
+        cache_key = (relationship.pk, side, tuple(reversed(field_path)))
         entry = cache.setdefault(cache_key, {"resolutions": 0, "peers_by_parent": None})
         entry["resolutions"] += 1
 
