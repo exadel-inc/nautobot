@@ -11,9 +11,11 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
+from django.db import connection
 from django.db.models import Count, Q
 from django.test import override_settings, tag
 from django.test.client import RequestFactory
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 import graphene.types
 from graphene_django.registry import get_global_registry
@@ -731,6 +733,129 @@ class GraphQLRelatedObjectPermissionTest(GraphQLTestCaseBase):
             "Wrap each with permission_safe_resolver / permission_safe_attribute_resolver (or allow-list with "
             "justification):\n" + "\n".join(sorted(unenforced)),
         )
+
+
+class GraphQLRelationshipQueryCountTest(GraphQLTestCaseBase):
+    """Resolving relationship fields on a list of objects must not issue queries per parent object."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create(username="relationship_count_user", is_active=True, is_superuser=True)
+        cls.location_type = LocationType.objects.get(name="Campus")
+        cls.location_status = Status.objects.get_for_model(Location)[0]
+        cls.vlan_status = Status.objects.get_for_model(VLAN)[0]
+        location_ct = ContentType.objects.get_for_model(Location)
+        vlan_ct = ContentType.objects.get_for_model(VLAN)
+
+        cls.relationships = {}
+        for rel_type in ("many-to-many", "one-to-many", "one-to-one"):
+            cls.relationships[rel_type] = Relationship.objects.create(
+                label=f"Count {rel_type}",
+                key=f"count_{rel_type.replace('-', '_')}",
+                source_type=location_ct,
+                destination_type=vlan_ct,
+                type=rel_type,
+            )
+        cls.symmetric = Relationship.objects.create(
+            label="Count symmetric",
+            key="count_symmetric",
+            source_type=location_ct,
+            destination_type=location_ct,
+            type="symmetric-many-to-many",
+        )
+
+    def setUp(self):
+        super().setUp()
+        self.counter = 0
+
+    def _populate(self, count):
+        """Create `count` locations, each associated with VLANs and another location via every relationship."""
+        locations = []
+        for _ in range(count):
+            self.counter += 1
+            locations.append(
+                Location.objects.create(
+                    name=f"Count Location {self.counter}", location_type=self.location_type, status=self.location_status
+                )
+            )
+        for index, location in enumerate(locations):
+            for rel_type, relationship in self.relationships.items():
+                for _ in range(2 if rel_type == "many-to-many" else 1):
+                    self.counter += 1
+                    vlan = VLAN.objects.create(
+                        name=f"Count VLAN {self.counter}", vid=self.counter, status=self.vlan_status
+                    )
+                    RelationshipAssociation.objects.create(relationship=relationship, source=location, destination=vlan)
+            RelationshipAssociation.objects.create(
+                relationship=self.symmetric, source=location, destination=locations[index - 1]
+            )
+        return locations
+
+    @staticmethod
+    def _field(relationship):
+        return f"rel_{str_to_var_name(relationship.key)}"
+
+    def _count_queries(self, query):
+        """Run `query` once to warm per-user caches, then return the result and query count of a second run."""
+        execute_query_on_rebuilt_schema(query, user=self.user)
+        with CaptureQueriesContext(connection) as ctx:
+            result = execute_query_on_rebuilt_schema(query, user=self.user)
+        self.assertIsNone(result.errors)
+        return result, len(ctx)
+
+    def _assert_constant_queries(self, query):
+        self._populate(3)
+        _, small = self._count_queries(query)
+        self._populate(8)
+        result, large = self._count_queries(query)
+        self.assertEqual(small, large, f"query count grew with the number of parent objects: {small} -> {large}")
+        return result
+
+    def test_location_relationships_query_count_independent_of_object_count(self):
+        fields = " ".join(f"{self._field(rel)} {{ name }}" for rel in (*self.relationships.values(), self.symmetric))
+        query = f'query {{ locations(name__ic: "Count Location") {{ name {fields} }} }}'
+        result = self._assert_constant_queries(query)
+        self.assertEqual(len(result.data["locations"]), 11)
+
+    def test_single_peer_side_query_count_independent_of_object_count(self):
+        """The destination side of one-to-many / one-to-one has a single peer."""
+        one_to_many = self._field(self.relationships["one-to-many"])
+        one_to_one = self._field(self.relationships["one-to-one"])
+        query = f'query {{ vlans(name__ic: "Count VLAN") {{ name {one_to_many} {{ name }} {one_to_one} {{ name }} }} }}'
+        result = self._assert_constant_queries(query)
+        peered = [vlan for vlan in result.data["vlans"] if vlan[one_to_many] or vlan[one_to_one]]
+        self.assertEqual(len(peered), 22)
+
+    def test_peers_match_associations(self):
+        locations = self._populate(4)
+        m2m = self._field(self.relationships["many-to-many"])
+        symmetric = self._field(self.symmetric)
+        query = f'query {{ locations(name__ic: "Count Location") {{ name {m2m} {{ name }} {symmetric} {{ name }} }} }}'
+        result = execute_query_on_rebuilt_schema(query, user=self.user)
+        self.assertIsNone(result.errors)
+        by_name = {loc["name"]: loc for loc in result.data["locations"]}
+        for location in locations:
+            data = by_name[location.name]
+            expected_m2m = {
+                assoc.destination.name
+                for assoc in RelationshipAssociation.objects.filter(
+                    relationship=self.relationships["many-to-many"], source_id=location.pk
+                )
+            }
+            self.assertEqual({vlan["name"] for vlan in data[m2m]}, expected_m2m)
+            symmetric_assocs = RelationshipAssociation.objects.filter(relationship=self.symmetric)
+            expected_symmetric = {a.destination.name for a in symmetric_assocs if a.source_id == location.pk} | {
+                a.source.name for a in symmetric_assocs if a.destination_id == location.pk
+            }
+            self.assertEqual({peer["name"] for peer in data[symmetric]}, expected_symmetric)
+
+        one_to_one = self._field(self.relationships["one-to-one"])
+        assoc = RelationshipAssociation.objects.get(
+            relationship=self.relationships["one-to-one"], source_id=locations[0].pk
+        )
+        query = f'query {{ vlans(name: "{assoc.destination.name}") {{ {one_to_one} {{ name }} }} }}'
+        result = execute_query_on_rebuilt_schema(query, user=self.user)
+        self.assertEqual(result.data["vlans"][0][one_to_one]["name"], locations[0].name)
 
 
 class GraphQLExtendSchemaType(GraphQLTestCaseBase):
