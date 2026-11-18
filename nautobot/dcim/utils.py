@@ -49,18 +49,27 @@ def path_node_to_object(representation):
     return ct.model_class().objects.get(pk=object_id)
 
 
+def _get_cabled_breakout_parent(record):
+    """
+    Return the parent trunk interface if `record` is a breakout child whose lane is cabled, else `None`.
+
+    A breakout child (sub)interface has no cable of its own, so it follows its parent trunk's cable, but only
+    when its lane's far connector is occupied. `parent_interface_id` / `get_breakout_lane` are Interface-only,
+    so guard for other cable-terminable types (console/power ports, etc.).
+    """
+    lane = record.get_breakout_lane() if getattr(record, "parent_interface_id", None) else None
+    if lane and lane.far_termination:
+        return record.parent_interface
+    return None
+
+
 def cable_status_color_css(record):
     """
     Given a record such as an Interface, return the CSS needed to apply appropriate coloring to it.
     """
     if not record.cable:
-        # A breakout child (sub)interface has no cable of its own; color it after its parent trunk's
-        # cable when its lane is connected. `parent_interface` / `get_breakout_lane` are Interface-only,
-        # so guard for other cable-terminable types (console/power ports, etc.).
-        lane = record.get_breakout_lane() if getattr(record, "parent_interface_id", None) else None
-        if lane and lane.far_termination:
-            return cable_status_color_css(record.parent_interface)
-        return ""
+        parent = _get_cabled_breakout_parent(record)
+        return cable_status_color_css(parent) if parent else ""
 
     CABLE_STATUS_TO_CSS_CLASS = {
         ColorChoices.COLOR_GREEN: "table-success",
@@ -72,16 +81,11 @@ def cable_status_color_css(record):
 
 
 def get_cable_pk(record):
-    """Given an interface, try to return its cable's primary key."""
+    """Given an interface, try to return its cable's primary key, or that of its parent if it's a cabled breakout lane."""
     if record.cable:
         return record.cable.pk
-    if (
-        record.parent_interface_id
-        and record.breakout_position is not None
-        and record.parent_interface.cable is not None
-    ):
-        return record.parent_interface.cable.pk
-    return ""
+    parent = _get_cabled_breakout_parent(record)
+    return parent.cable.pk if parent else ""
 
 
 def get_network_driver_mapping_tool_names():

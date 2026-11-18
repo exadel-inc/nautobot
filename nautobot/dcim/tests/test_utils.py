@@ -310,6 +310,57 @@ class GetCablePkTestCase(TestCase):
         cls.breakout_cable.save()
         cls.breakout_cable.add_termination(leaf_interfaces[1], "B", connector=2)
 
+        # A position the 1x2 trunk doesn't carry, and a child whose parent has no cable.
+        cls.uncarried_position_child = Interface.objects.create(
+            device=spine_device,
+            name="Spine Interface 1/3",
+            type=InterfaceTypeChoices.TYPE_VIRTUAL,
+            status=status_active,
+            parent_interface=cls.spine_interface,
+            breakout_position=3,
+        )
+        cls.uncabled_parent_child = Interface.objects.create(
+            device=spine_device,
+            name="eth-uncabled/1",
+            type=InterfaceTypeChoices.TYPE_VIRTUAL,
+            status=status_active,
+            parent_interface=cls.uncabled_interface,
+            breakout_position=1,
+        )
+
+        # A 1x4 breakout where only far connectors 1 and 3 are cabled, so lanes 2 and 4 are unoccupied.
+        partial_trunk = Interface.objects.create(
+            device=spine_device,
+            name="Spine Interface 2",
+            type=InterfaceTypeChoices.TYPE_100GE_QSFP28,
+            status=status_active,
+        )
+        cls.partial_children = {
+            position: Interface.objects.create(
+                device=spine_device,
+                name=f"Spine Interface 2/{position}",
+                type=InterfaceTypeChoices.TYPE_VIRTUAL,
+                status=status_active,
+                parent_interface=partial_trunk,
+                breakout_position=position,
+            )
+            for position in range(1, 5)
+        }
+        partial_leaves = [
+            Interface.objects.create(device=leaf_device, name=f"Partial Leaf {i}", status=status_active) for i in (1, 3)
+        ]
+        partial_type = CableType.objects.create(
+            name="1x4 Breakout Cable", a_connectors=1, b_connectors=4, total_lanes=4
+        )
+        cls.partial_cable = Cable(
+            termination_a=partial_trunk,
+            termination_b=partial_leaves[0],
+            cable_type=partial_type,
+            status=status_connected,
+        )
+        cls.partial_cable.save()
+        cls.partial_cable.add_termination(partial_leaves[1], "B", connector=3)
+
     def test_get_cable_pk_breakout_child_returns_parent_cable_pk(self):
         self.assertIsNone(self.spine_interface_child.cable)
         self.assertIsNotNone(self.spine_interface_child.parent_interface_id)
@@ -324,3 +375,14 @@ class GetCablePkTestCase(TestCase):
     def test_get_cable_pk_uncabled_interface_returns_empty_string(self):
         self.assertIsNone(self.uncabled_interface.cable)
         self.assertEqual(get_cable_pk(self.uncabled_interface), "")
+
+    def test_get_cable_pk_partially_cabled_breakout_only_cabled_lanes(self):
+        for position, expected in ((1, self.partial_cable.pk), (2, ""), (3, self.partial_cable.pk), (4, "")):
+            with self.subTest(position=position):
+                self.assertEqual(get_cable_pk(self.partial_children[position]), expected)
+
+    def test_get_cable_pk_breakout_child_position_not_carried_by_trunk_returns_empty_string(self):
+        self.assertEqual(get_cable_pk(self.uncarried_position_child), "")
+
+    def test_get_cable_pk_breakout_child_of_uncabled_parent_returns_empty_string(self):
+        self.assertEqual(get_cable_pk(self.uncabled_parent_child), "")
