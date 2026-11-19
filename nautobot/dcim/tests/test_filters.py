@@ -1,4 +1,5 @@
 # pylint: disable=no-member  # it doesn't recognize the class attributes assigned in common_test_data()
+from unittest import mock
 import uuid
 
 from django.contrib.auth import get_user_model
@@ -906,8 +907,12 @@ def common_test_data(cls):
     cls.controller_managed_device_groups[1].tags.set(Tag.objects.get_for_model(ControllerManagedDeviceGroup)[:3])
 
 
-def create_descendant_location(campus):
-    """Create a Building and a Floor below `campus`, and return the Floor."""
+def create_descendant_location(test_case, campus):
+    """Create a Building and a Floor below `campus`, and return the Floor.
+
+    Parallel test workers share the cached tree depth but not their databases, so for the rest of the test the cached
+    depth is replaced by the depth of this test's tree.
+    """
     status = Status.objects.get_for_model(Location).first()
     building = Location.objects.create(
         name=f"{campus.name} Building",
@@ -915,12 +920,21 @@ def create_descendant_location(campus):
         parent=campus,
         status=status,
     )
-    return Location.objects.create(
+    floor = Location.objects.create(
         name=f"{campus.name} Floor",
         location_type=LocationType.objects.get(name="Floor"),
         parent=building,
         status=status,
     )
+    test_case.enterContext(
+        mock.patch.object(
+            type(Location.objects),
+            "max_depth",
+            new_callable=mock.PropertyMock,
+            return_value=Location.objects.max_tree_depth(),
+        )
+    )
+    return floor
 
 
 class ComponentTemplateTestMixin:
@@ -961,7 +975,7 @@ class DeviceComponentTestMixin:
     def test_location_subtree(self):
         component = self.queryset.first()
         campus = component.device.location
-        floor = create_descendant_location(campus)
+        floor = create_descendant_location(self, campus)
         Device.objects.filter(pk=component.device.pk).update(location=floor)
         expected = self.queryset.filter(device__location=floor)
         self.assertIn(component, expected)
@@ -3292,7 +3306,7 @@ class InventoryItemTestCase(DeviceComponentTestMixin, FilterTestCases.FilterTest
         """Move "Device 1" to a Floor below its Campus; return the Campus and the Floor."""
         device = Device.objects.get(name="Device 1")
         campus = device.location
-        floor = create_descendant_location(campus)
+        floor = create_descendant_location(self, campus)
         Device.objects.filter(pk=device.pk).update(location=floor)
         return campus, floor
 
@@ -3349,7 +3363,6 @@ class InventoryItemTestCase(DeviceComponentTestMixin, FilterTestCases.FilterTest
 
     def test_location_subtree_query_count(self):
         campus, floor = self._move_device_to_descendant_location()
-        Location.objects.max_depth  # pylint: disable=pointless-statement
         filterset = self.filterset({"location_subtree": [campus.pk]}, self.queryset)
         with self.assertNumQueries(3):
             list(filterset.qs)
@@ -3463,7 +3476,7 @@ class VirtualChassisTestCase(FilterTestCases.FilterTestCase):
 
     def test_location_subtree(self):
         campus = self.locations[0]
-        floor = create_descendant_location(campus)
+        floor = create_descendant_location(self, campus)
         Device.objects.filter(name="Device 1").update(location=floor)
         expected = self.queryset.filter(master__location=floor)
         self.assertTrue(expected.exists())
@@ -4993,10 +5006,9 @@ class _ConnectionFilterSetTestMixin:
             name=name, device_type=device_type, role=device_role, location=location, status=device_status
         )
 
-    @staticmethod
-    def _move_device_to_descendant_location(device):
+    def _move_device_to_descendant_location(self, device):
         """Move `device` to a Floor below a new Building; return the Building."""
-        floor = create_descendant_location(device.location)
+        floor = create_descendant_location(self, device.location)
         Device.objects.filter(pk=device.pk).update(location=floor)
         return floor.parent
 
