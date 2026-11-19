@@ -1,5 +1,6 @@
 import contextlib
 import datetime
+import itertools
 import random
 from textwrap import dedent
 import types
@@ -11,9 +12,11 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
+from django.db import connection
 from django.db.models import Count, Q
 from django.test import override_settings, tag
 from django.test.client import RequestFactory
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 import graphene.types
 from graphene_django.registry import get_global_registry
@@ -2041,6 +2044,97 @@ query {
         self.assertIsInstance(result.data["device"]["rel_device_group"], list, result)
         self.assertIn(str(self.device2.id), set(item["id"] for item in result.data["device"]["rel_device_group"]))
         self.assertIn(str(self.device3.id), set(item["id"] for item in result.data["device"]["rel_device_group"]))
+
+    def _create_location_relationship(self, key):
+        self.location_relationship = Relationship(
+            label=key,
+            key=key,
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(Location),
+            type="many-to-many",
+        )
+        self.location_relationship.validated_save()
+
+    def _create_location_peers(self, parent, count):
+        """Create `count` locations that are destinations of `parent`, each also linked to the next one."""
+        location_status = Status.objects.get_for_model(Location).first()
+        peers = [
+            Location.objects.create(
+                name=f"Peer {uuid.uuid4()}", location_type=self.location_type, status=location_status
+            )
+            for _ in range(count)
+        ]
+        for peer in peers:
+            RelationshipAssociation(
+                relationship=self.location_relationship, source=parent, destination=peer
+            ).validated_save()
+        for first, second in itertools.pairwise(peers):
+            RelationshipAssociation(
+                relationship=self.location_relationship, source=first, destination=second
+            ).validated_save()
+        return peers
+
+    def test_query_relationship_list_has_constant_query_count(self):
+        """Relationship fields of a list of objects are loaded in bulk, in the default order of the peer model."""
+        self._create_location_relationship("location_list")
+        schema = rebuild_graphql_schema().graphql_schema
+        query = parse(
+            "query { locations { name rel_location_list_destination { name } rel_location_list_source { name } } }"
+        )
+
+        def run_query():
+            with CaptureQueriesContext(connection) as queries:
+                result = execute(schema=schema, document=query, context_value=self.request)
+            self.assertIsNone(result.errors)
+            return {item["name"]: item for item in result.data["locations"]}, queries
+
+        self._create_location_peers(self.location1, 2)
+        _, small_data = run_query()
+        peers = self._create_location_peers(self.location1, 4)
+        locations, large_data = run_query()
+
+        self.assertEqual(len(small_data), len(large_data))
+        self.assertEqual(
+            [peer["name"] for peer in locations[self.location1.name]["rel_location_list_destination"]],
+            list(Location.objects.filter(name__startswith="Peer").values_list("name", flat=True)),
+        )
+        self.assertEqual(
+            [peer["name"] for peer in locations[peers[1].name]["rel_location_list_source"]],
+            list(Location.objects.filter(pk__in=[self.location1.pk, peers[0].pk]).values_list("name", flat=True)),
+        )
+        self.assertEqual(locations[self.location2.name]["rel_location_list_destination"], [])
+
+    def test_query_relationship_nested_only_loads_requested_objects(self):
+        """Nested relationship fields only load associations and peers of the objects the query returned."""
+        self._create_location_relationship("location_nested")
+        self.device1.location = self.location1
+        self.device1.validated_save()
+        schema = rebuild_graphql_schema().graphql_schema
+        query = parse(
+            f"""query {{ device(id: "{self.device1.pk}") {{
+                rel_device_group {{ name }}
+                location {{ name rel_location_nested_destination {{ name }} }}
+            }} }}"""
+        )
+        self._create_location_peers(self.location1, 2)
+
+        def run_query():
+            with CaptureQueriesContext(connection) as queries:
+                result = execute(schema=schema, document=query, context_value=self.request)
+            self.assertIsNone(result.errors)
+            return result.data, queries
+
+        data, small_data = run_query()
+        self.assertEqual(len(data["device"]["location"]["rel_location_nested_destination"]), 2)
+
+        unrelated = [self.location2, *self._create_location_peers(self.location2, 3)]
+        _, large_data = run_query()
+
+        self.assertEqual(len(small_data), len(large_data))
+        sql = " ".join(captured["sql"] for captured in large_data)
+        for location in unrelated:
+            self.assertNotIn(str(location.pk), sql)
+            self.assertNotIn(location.pk.hex, sql)
 
     @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
     def test_query_device_role_filter(self):
