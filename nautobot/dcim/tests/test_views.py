@@ -3696,6 +3696,35 @@ class ConsolePortTestCase(ViewTestCases.DeviceComponentViewTestCase):
             "description": "new test description",
         }
 
+    def test_create_console_port_keeps_module_when_opened_from_device(self):
+        """https://github.com/nautobot/nautobot/issues/9589: `?device=` must not drop the selected module."""
+        self.add_permissions("dcim.add_consoleport", "dcim.view_module")
+        device = Device.objects.first()
+        module_bay = ModuleBay.objects.create(parent_device=device, name="Issue 9589 Console Bay", position="1")
+        module = Module.objects.create(
+            module_type=ModuleType.objects.create(
+                manufacturer=Manufacturer.objects.first(), model="Issue 9589 Console Type"
+            ),
+            parent_module_bay=module_bay,
+            status=Status.objects.get_for_model(Module).first(),
+        )
+
+        response = self.client.post(
+            f"{self._get_url('add')}?device={device.pk}",
+            post_data(
+                {
+                    "device": device.pk,
+                    "module": module.pk,
+                    "name_pattern": "Issue 9589 Console Port",
+                    "type": ConsolePortTypeChoices.TYPE_RJ45,
+                }
+            ),
+        )
+        self.assertHttpStatus(response, 302)
+        console_port = ConsolePort.objects.get(name="Issue 9589 Console Port")
+        self.assertEqual(console_port.module, module)
+        self.assertEqual(console_port.device, device)
+
     def test_get_selected_objects_parents_name_empty(self):
         """Covers the empty-queryset branch (`return ""`) in get_selected_objects_parents_name."""
         viewset = ConsolePortUIViewSet()
@@ -4204,6 +4233,78 @@ class InterfaceTestCase(ViewTestCases.DeviceComponentViewTestCase):
         interface.refresh_from_db()
         self.assertEqual(interface.description, "Edited via the UI")
         self.assertEqual(list(interface.tagged_vlans.all()), [vlan])
+
+    def _create_device_module(self, device, label):
+        """Create a Module installed in a new bay of the given Device."""
+        module_bay = ModuleBay.objects.create(parent_device=device, name=f"{label} Bay", position="1")
+        return Module.objects.create(
+            module_type=ModuleType.objects.create(manufacturer=Manufacturer.objects.first(), model=f"{label} Type"),
+            parent_module_bay=module_bay,
+            status=Status.objects.get_for_model(Module).first(),
+        )
+
+    def _post_interfaces_add(self, query, name_pattern, module=None):
+        device = Device.objects.first()
+        data = {
+            "device": device.pk,
+            "name_pattern": name_pattern,
+            "status": Status.objects.get_for_model(Interface).first().pk,
+            "type": InterfaceTypeChoices.TYPE_1GE_FIXED,
+        }
+        if module is not None:
+            data["module"] = module.pk
+        return self.client.post(f"{self._get_url('add')}{query}", post_data(data))
+
+    def test_create_interface_keeps_module_when_opened_from_device(self):
+        """https://github.com/nautobot/nautobot/issues/9589: `?device=` must not drop the selected module."""
+        self.add_permissions("dcim.add_interface", "dcim.view_module", "extras.view_status")
+        device = Device.objects.first()
+        module = self._create_device_module(device, "Issue 9589 Interface")
+
+        response = self._post_interfaces_add(f"?device={device.pk}", "Issue 9589 Interface 1", module)
+        self.assertHttpStatus(response, 302)
+        interface = Interface.objects.get(name="Issue 9589 Interface 1")
+        self.assertEqual(interface.module, module)
+        self.assertEqual(interface.device, device)
+
+    def test_create_interface_keeps_module_with_module_query_or_no_query(self):
+        self.add_permissions("dcim.add_interface", "dcim.view_module", "extras.view_status")
+        device = Device.objects.first()
+        module = self._create_device_module(device, "Issue 9589 Query")
+
+        for query, name in ((f"?module={module.pk}", "Module Query 1"), ("", "No Query 1")):
+            with self.subTest(query=query):
+                self.assertHttpStatus(self._post_interfaces_add(query, name, module), 302)
+                self.assertEqual(Interface.objects.get(name=name).module, module)
+
+    def test_create_interface_from_device_without_module(self):
+        self.add_permissions("dcim.add_interface", "dcim.view_module", "extras.view_status")
+        device = Device.objects.first()
+
+        response = self._post_interfaces_add(f"?device={device.pk}", "Issue 9589 No Module 1")
+        self.assertHttpStatus(response, 302)
+        interface = Interface.objects.get(name="Issue 9589 No Module 1")
+        self.assertIsNone(interface.module)
+        self.assertEqual(interface.device, device)
+
+    def test_create_interfaces_with_name_pattern_keeps_module_when_opened_from_device(self):
+        self.add_permissions("dcim.add_interface", "dcim.view_module", "extras.view_status")
+        device = Device.objects.first()
+        module = self._create_device_module(device, "Issue 9589 Pattern")
+
+        response = self._post_interfaces_add(f"?device={device.pk}", "Issue 9589 Pattern [5-6]", module)
+        self.assertHttpStatus(response, 302)
+        interfaces = Interface.objects.filter(name__startswith="Issue 9589 Pattern ")
+        self.assertEqual(interfaces.count(), 2)
+        self.assertEqual({interface.module for interface in interfaces}, {module})
+
+    def test_get_interface_add_form_from_device_prefills_device(self):
+        self.add_permissions("dcim.add_interface")
+        device = Device.objects.first()
+
+        response = self.client.get(f"{self._get_url('add')}?device={device.pk}")
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(response.context["form"].initial["device"], str(device.pk))
 
     def test_create_interface_on_module_without_parent_device(self):
         """A tagged interface can be created on a Module that has no parent Device."""

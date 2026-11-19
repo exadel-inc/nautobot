@@ -2270,8 +2270,13 @@ class ComponentCreateViewMixin(ObjectEditViewMixin):
 
     def get_component_model_form(self, request, data=None):
         """Return the per-instance component model form used to validate/save each expanded child."""
+        if data:
+            # Submitted data already carries the validated device/module. Passing the query string as
+            # initial data too would make ModularComponentEditForm disable both fields and fall back
+            # to that initial data, silently discarding the selected module.
+            return self.form_class(data)  # pylint: disable=not-callable
         return self.form_class(  # pylint: disable=not-callable
-            data or None,
+            None,
             initial=normalize_querydict(request.GET, form_class=self.form_class),
         )
 
