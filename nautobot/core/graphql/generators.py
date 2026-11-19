@@ -241,14 +241,24 @@ def generate_computed_field_resolver(name, resolver_name):
 
 
 def expand_model_ordering(model, prefix=""):
-    """Return the default ordering of a model as expressions, following related models' ordering like Django does."""
+    """Return the default ordering of a model as expressions, following related models' ordering like Django does.
+
+    Returns None when the ordering has anything other than plain field names and plain foreign keys, such as
+    expressions, `__` paths or `<fk>_id` names, because those are not resolved here the way Django resolves them.
+    """
     expressions = []
     for name in model._meta.ordering or ["pk"]:
+        if not isinstance(name, str) or "__" in name:
+            return None
         descending = name.startswith("-")
         field_name = name.lstrip("-")
         field = None if field_name == "pk" else model._meta.get_field(field_name)
+        if field is not None and field.is_relation and field.attname == field_name:
+            return None
         if field is not None and field.is_relation and field.related_model._meta.ordering:
             related = expand_model_ordering(field.related_model, f"{prefix}{field_name}__")
+            if related is None:
+                return None
             expressions += [expression.reverse_ordering() if descending else expression for expression in related]
         else:
             expressions.append(F(f"{prefix}{field_name}").desc() if descending else F(f"{prefix}{field_name}").asc())
@@ -277,15 +287,15 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         """Prefetch the associations of all parents loaded at this level, with their permitted peers.
 
         Symmetric relationships are not prefetched: their peers come from two queries whose order can't be merged.
+        Neither are peers whose model ordering can't be expanded by `expand_model_ordering`.
         """
-        if relationship.symmetric:
+        peer_ordering = expand_model_ordering(peer_model)
+        if relationship.symmetric or peer_ordering is None:
             return []
         peer_queryset = peer_model.objects.all()
         if hasattr(peer_queryset, "restrict"):
             peer_queryset = peer_queryset.restrict(info.context.user, "view")
-        peer_queryset = peer_queryset.annotate(
-            peer_rank=Window(RowNumber(), order_by=expand_model_ordering(peer_model))
-        )
+        peer_queryset = peer_queryset.annotate(peer_rank=Window(RowNumber(), order_by=peer_ordering))
         associations = RelationshipAssociation.objects.filter(relationship=relationship).prefetch_related(
             GenericPrefetch(peer_side, [gql_optimizer.query(peer_queryset, info)])
         )

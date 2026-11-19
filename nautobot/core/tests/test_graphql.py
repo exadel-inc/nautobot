@@ -2182,6 +2182,36 @@ query {
         )
         self.assertEqual(location["rel_location_vlan_order"][0]["name"], "Order VLAN 5")
 
+    def test_query_relationship_list_keeps_interface_peer_ordering(self):
+        """A list query over a relationship to interfaces, whose model ordering is not a plain field, still works."""
+        relationship = Relationship(
+            label="Location to Interface order",
+            key="location_interface_order",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(Interface),
+            type="many-to-many",
+        )
+        relationship.validated_save()
+        interface_status = Status.objects.get_for_model(Interface).first()
+        for name in ["Ethernet10", "Ethernet2", "Ethernet1"]:
+            interface = Interface.objects.create(
+                device=self.device1, name=name, status=interface_status, type=InterfaceTypeChoices.TYPE_VIRTUAL
+            )
+            RelationshipAssociation(
+                relationship=relationship, source=self.location1, destination=interface
+            ).validated_save()
+        schema = rebuild_graphql_schema().graphql_schema
+        query = parse("query { locations { name rel_location_interface_order { name } } }")
+
+        result = execute(schema=schema, document=query, context_value=self.request)
+
+        self.assertIsNone(result.errors)
+        location = next(item for item in result.data["locations"] if item["name"] == self.location1.name)
+        self.assertEqual(
+            [interface["name"] for interface in location["rel_location_interface_order"]],
+            list(Interface.objects.filter(name__startswith="Ethernet").values_list("name", flat=True)),
+        )
+
     def test_query_relationship_list_one_to_one_without_association_is_null(self):
         """A one-to-one relationship field of a list query is null for an object without an association."""
         schema = rebuild_graphql_schema().graphql_schema
