@@ -2107,13 +2107,25 @@ query {
     def test_query_relationship_nested_only_loads_requested_objects(self):
         """Nested relationship fields only load associations and peers of the objects the query returned."""
         self._create_location_relationship("location_nested")
+        vrf_relationship = Relationship(
+            label="VRF to Location",
+            key="vrf_nested",
+            source_type=ContentType.objects.get_for_model(VRF),
+            destination_type=ContentType.objects.get_for_model(Location),
+            type="many-to-many",
+        )
+        vrf_relationship.validated_save()
+        vrf = VRF.objects.get(name="VRF 1")
+        RelationshipAssociation(relationship=vrf_relationship, source=vrf, destination=self.location1).validated_save()
         self.device1.location = self.location1
         self.device1.validated_save()
+        self.device1.vrfs.add(vrf)
         schema = rebuild_graphql_schema().graphql_schema
         query = parse(
             f"""query {{ device(id: "{self.device1.pk}") {{
-                rel_device_group {{ name }}
+                rel_device_to_vm {{ name }}
                 location {{ name rel_location_nested_destination {{ name }} }}
+                vrfs {{ name rel_vrf_nested {{ name }} }}
             }} }}"""
         )
         self._create_location_peers(self.location1, 2)
@@ -2126,6 +2138,10 @@ query {
 
         data, small_data = run_query()
         self.assertEqual(len(data["device"]["location"]["rel_location_nested_destination"]), 2)
+        self.assertEqual(
+            [peer["name"] for peer in data["device"]["vrfs"][0]["rel_vrf_nested"]],
+            [self.location1.name],
+        )
 
         unrelated = [self.location2, *self._create_location_peers(self.location2, 3)]
         _, large_data = run_query()
@@ -2135,6 +2151,48 @@ query {
         for location in unrelated:
             self.assertNotIn(str(location.pk), sql)
             self.assertNotIn(location.pk.hex, sql)
+
+    def test_query_relationship_list_keeps_peer_model_ordering(self):
+        """Peers are returned in the order of the peer model's queryset, including ordering by a related model."""
+        relationship = Relationship(
+            label="Location to VLAN order",
+            key="location_vlan_order",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(VLAN),
+            type="many-to-many",
+        )
+        relationship.validated_save()
+        vlan_status = Status.objects.get_for_model(VLAN).first()
+        for index in range(6):
+            group = VLANGroup.objects.create(name=f"Order group {6 - index}")
+            vlan = VLAN.objects.create(
+                name=f"Order VLAN {index}", vid=3000 + index, status=vlan_status, vlan_group=group
+            )
+            RelationshipAssociation(relationship=relationship, source=self.location1, destination=vlan).validated_save()
+        schema = rebuild_graphql_schema().graphql_schema
+        query = parse("query { locations { name rel_location_vlan_order { name } } }")
+
+        result = execute(schema=schema, document=query, context_value=self.request)
+
+        self.assertIsNone(result.errors)
+        location = next(item for item in result.data["locations"] if item["name"] == self.location1.name)
+        self.assertEqual(
+            [vlan["name"] for vlan in location["rel_location_vlan_order"]],
+            list(VLAN.objects.filter(name__startswith="Order VLAN").values_list("name", flat=True)),
+        )
+        self.assertEqual(location["rel_location_vlan_order"][0]["name"], "Order VLAN 5")
+
+    def test_query_relationship_list_one_to_one_without_association_is_null(self):
+        """A one-to-one relationship field of a list query is null for an object without an association."""
+        schema = rebuild_graphql_schema().graphql_schema
+        query = parse("query { devices { name rel_device_to_vm { name } } }")
+
+        result = execute(schema=schema, document=query, context_value=self.request)
+
+        self.assertIsNone(result.errors)
+        peers = {device["name"]: device["rel_device_to_vm"] for device in result.data["devices"]}
+        self.assertEqual(peers[self.device1.name], {"name": self.virtualmachine.name})
+        self.assertIsNone(peers[self.device2.name])
 
     @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
     def test_query_device_role_filter(self):

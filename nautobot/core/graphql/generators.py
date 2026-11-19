@@ -4,7 +4,7 @@ import logging
 
 from django.contrib.contenttypes.prefetch import GenericPrefetch
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import Prefetch, Window
+from django.db.models import F, Prefetch, Window
 from django.db.models.functions import RowNumber
 import graphene
 import graphene_django_optimizer as gql_optimizer
@@ -240,6 +240,21 @@ def generate_computed_field_resolver(name, resolver_name):
     return resolve_computed_field
 
 
+def expand_model_ordering(model, prefix=""):
+    """Return the default ordering of a model as expressions, following related models' ordering like Django does."""
+    expressions = []
+    for name in model._meta.ordering or ["pk"]:
+        descending = name.startswith("-")
+        field_name = name.lstrip("-")
+        field = None if field_name == "pk" else model._meta.get_field(field_name)
+        if field is not None and field.is_relation and field.related_model._meta.ordering:
+            related = expand_model_ordering(field.related_model, f"{prefix}{field_name}__")
+            expressions += [expression.reverse_ordering() if descending else expression for expression in related]
+        else:
+            expressions.append(F(f"{prefix}{field_name}").desc() if descending else F(f"{prefix}{field_name}").asc())
+    return expressions
+
+
 def generate_relationship_resolver(name, resolver_name, relationship, side, peer_model):
     """Generate function to resolve each custom relationship within each DjangoObjectType.
 
@@ -269,7 +284,7 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         if hasattr(peer_queryset, "restrict"):
             peer_queryset = peer_queryset.restrict(info.context.user, "view")
         peer_queryset = peer_queryset.annotate(
-            peer_rank=Window(RowNumber(), order_by=peer_model._meta.ordering or ["pk"])
+            peer_rank=Window(RowNumber(), order_by=expand_model_ordering(peer_model))
         )
         associations = RelationshipAssociation.objects.filter(relationship=relationship).prefetch_related(
             GenericPrefetch(peer_side, [gql_optimizer.query(peer_queryset, info)])
