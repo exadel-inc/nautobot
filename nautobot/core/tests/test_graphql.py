@@ -3075,8 +3075,9 @@ query {
             type="many-to-many",
         )
         locations = list(Location.objects.all()[:4])
+        vlans_in_default_order = list(VLAN.objects.filter(pk__in=[self.vlan1.pk, self.vlan2.pk]))
         for location in locations:
-            for vlan in (self.vlan1, self.vlan2):
+            for vlan in reversed(vlans_in_default_order):
                 RelationshipAssociation.objects.create(relationship=relationship, source=location, destination=vlan)
         field = f"rel_{str_to_var_name(relationship.key)}"
         list_query = f"query {{ locations {{ id {field} {{ name }} }} }}"
@@ -3092,9 +3093,30 @@ query {
         self.assertEqual(len(list_queries), len(single_queries))
         by_id = {item["id"]: item[field] for item in result.data["locations"]}
         for location in locations:
-            self.assertCountEqual(
-                [vlan["name"] for vlan in by_id[str(location.pk)]], [self.vlan1.name, self.vlan2.name]
+            self.assertEqual(
+                [vlan["name"] for vlan in by_id[str(location.pk)]], [vlan.name for vlan in vlans_in_default_order]
             )
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_relationship_single_peer_on_list(self):
+        """A relationship field with a single peer returns that peer or null for each object of a list."""
+        relationship = Relationship.objects.create(
+            label="Location to VLANs",
+            key="location_to_vlans_single",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(VLAN),
+            type="one-to-many",
+        )
+        RelationshipAssociation.objects.create(relationship=relationship, source=self.location1, destination=self.vlan1)
+        field = f"rel_{str_to_var_name(relationship.key)}"
+        query = f"query {{ vlans {{ id {field} {{ name }} }} }}"
+
+        result = execute_query_on_rebuilt_schema(query, request=self.request)
+
+        self.assertIsNone(result.errors)
+        by_id = {item["id"]: item[field] for item in result.data["vlans"]}
+        self.assertEqual(by_id[str(self.vlan1.pk)], {"name": self.location1.name})
+        self.assertIsNone(by_id[str(self.vlan2.pk)])
 
     @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
     def test_query_relationship_aliases_return_separate_results(self):
@@ -3152,6 +3174,7 @@ query {
             f"location {{ {field(Location)} {{ name }} }} vrfs {{ {field(VRF)} {{ name }} }} }} }}"
         )
         schema = rebuild_graphql_schema().graphql_schema
+        execute(schema=schema, document=parse(query), context_value=self.request)
         with CaptureQueriesContext(connection) as queries:
             result = execute(schema=schema, document=parse(query), context_value=self.request)
 
