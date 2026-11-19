@@ -1,6 +1,7 @@
 import contextlib
 import datetime
 import random
+import re
 from textwrap import dedent
 import types
 from unittest import mock, TestCase as UnitTestTestCase
@@ -11,9 +12,11 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
+from django.db import connection
 from django.db.models import Count, Q
 from django.test import override_settings, tag
 from django.test.client import RequestFactory
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 import graphene.types
 from graphene_django.registry import get_global_registry
@@ -2041,6 +2044,163 @@ query {
         self.assertIsInstance(result.data["device"]["rel_device_group"], list, result)
         self.assertIn(str(self.device2.id), set(item["id"] for item in result.data["device"]["rel_device_group"]))
         self.assertIn(str(self.device3.id), set(item["id"] for item in result.data["device"]["rel_device_group"]))
+
+    def _create_vlan_relationships(self, key_prefix, models):
+        """Create a many-to-many Relationship from each of `models` to VLAN, and return the VLANs and the schema.
+
+        Each test needs its own `key_prefix`: the generated schema types keep the resolver of the first
+        Relationship with a given key for the rest of the test run.
+        """
+        vlan_status = Status.objects.get_for_model(VLAN).first()
+        vlans = [VLAN.objects.create(name=f"Rel VLAN {i}", vid=3000 + i, status=vlan_status) for i in range(12)]
+        relationships = {}
+        for model in models:
+            relationship = Relationship(
+                label=f"{model.__name__} to VLAN",
+                key=f"{key_prefix}_{model._meta.model_name}_to_vlan",
+                source_type=ContentType.objects.get_for_model(model),
+                destination_type=ContentType.objects.get_for_model(VLAN),
+                type="many-to-many",
+            )
+            relationship.validated_save()
+            relationships[model] = relationship
+        return vlans, relationships, rebuild_graphql_schema().graphql_schema
+
+    def _execute_on_schema(self, schema, query, variables=None):
+        return execute(schema=schema, document=parse(query), context_value=self.request, variable_values=variables)
+
+    @staticmethod
+    def _associate(relationship, source, vlans):
+        """Associate `source` to `vlans`, in reverse order of the VLAN default ordering."""
+        for vlan in reversed(vlans):
+            RelationshipAssociation.objects.create(relationship=relationship, source=source, destination=vlan)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_relationship_list_no_n_plus_one(self):
+        """The number of queries for a relationship field does not grow with the number of parent objects."""
+        vlans, relationships, schema = self._create_vlan_relationships("list", [Device])
+        Device.objects.create(
+            name="Device 5",
+            device_type=self.device_type1,
+            role=self.device_role1,
+            location=self.location1,
+            status=self.device_statuses[0],
+        )
+        devices = list(Device.objects.order_by("name"))
+        self.assertGreaterEqual(len(devices), 5)
+        for index, device in enumerate(devices):
+            self._associate(relationships[Device], device, vlans[index : index + 3])
+        # Warm up caches, so that only the per-object queries are counted below.
+        self._execute_on_schema(schema, "query { devices { name rel_list_device_to_vlan { name } } }")
+
+        counts = {}
+        for limit in (2, len(devices)):
+            query = f"query {{ devices(limit: {limit}) {{ name rel_list_device_to_vlan {{ name }} }} }}"
+            with CaptureQueriesContext(connection) as queries:
+                result = self._execute_on_schema(schema, query)
+            self.assertIsNone(result.errors)
+            self.assertEqual(len(result.data["devices"]), limit)
+            counts[limit] = len(queries)
+        self.assertEqual(counts[2], counts[len(devices)])
+
+        for device_data in result.data["devices"]:
+            device = Device.objects.get(name=device_data["name"])
+            peer_ids = device.source_for_associations.values_list("destination_id", flat=True)
+            expected = list(VLAN.objects.filter(pk__in=peer_ids).values_list("name", flat=True))
+            self.assertEqual([vlan["name"] for vlan in device_data["rel_list_device_to_vlan"]], expected)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_relationship_nested_scoped_to_requested_parents(self):
+        """Relationship fields nested under a device only load associations of the requested parents."""
+        vlans, relationships, schema = self._create_vlan_relationships("nested", [Device, Location, VRF])
+        vrfs = list(self.device2.vrfs.all()) + list(self.device1.vrfs.all())
+        self.assertGreaterEqual(len(vrfs), 2)
+        requested_parents = {self.device1.pk, self.device1.location.pk, *(vrf.pk for vrf in vrfs)}
+        wanted_vlans = vlans[:3]
+        for source in (self.device1, self.device1.location, *vrfs):
+            self._associate(relationships[type(source)], source, wanted_vlans)
+        for source in [self.device2, self.device3, self.location2, *VRF.objects.exclude(pk__in=requested_parents)]:
+            self._associate(relationships[type(source)], source, vlans[3:])
+        query = """
+        query ($id: ID!) {
+            device(id: $id) {
+                rel_nested_device_to_vlan { name }
+                location { rel_nested_location_to_vlan { name } }
+                vrfs { rel_nested_vrf_to_vlan { name } }
+            }
+        }
+        """
+        variables = {"id": str(self.device1.pk)}
+        self._execute_on_schema(schema, query, variables)
+
+        with CaptureQueriesContext(connection) as queries:
+            result = self._execute_on_schema(schema, query, variables)
+        self.assertIsNone(result.errors)
+        expected = [vlan.name for vlan in wanted_vlans]
+        device_data = result.data["device"]
+        self.assertEqual([vlan["name"] for vlan in device_data["rel_nested_device_to_vlan"]], expected)
+        self.assertEqual([vlan["name"] for vlan in device_data["location"]["rel_nested_location_to_vlan"]], expected)
+        for vrf_data in device_data["vrfs"]:
+            self.assertEqual([vlan["name"] for vlan in vrf_data["rel_nested_vrf_to_vlan"]], expected)
+
+        self.assertLessEqual(len(queries), 6)
+        uuid_pattern = re.compile(r"[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}")
+        association_table = RelationshipAssociation._meta.db_table
+        vlan_table = VLAN._meta.db_table
+        for query_info in queries:
+            sql = query_info["sql"]
+            if association_table in sql:
+                self.assertIn("IN (", sql)
+                # The requested parents, plus the Relationship id.
+                self.assertLessEqual(len(uuid_pattern.findall(sql)), len(requested_parents) + 1, sql)
+            elif vlan_table in sql and "IN (" in sql:
+                self.assertLessEqual(len(uuid_pattern.findall(sql)), len(wanted_vlans), sql)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_relationship_nested_peer_same_model_as_root(self):
+        """A nested peer of the same model as the root is not limited to the root objects."""
+        query = 'query { devices(name: "Device 1") { rel_device_group { name rel_device_group { name } } } }'
+        result = execute_query_on_rebuilt_schema(query, request=self.request)
+        self.assertIsNone(result.errors)
+        peers = result.data["devices"][0]["rel_device_group"]
+        self.assertEqual([peer["name"] for peer in peers], ["Device 2", "Device 3"])
+        for peer in peers:
+            expected = sorted({"Device 1", "Device 2", "Device 3"} - {peer["name"]})
+            self.assertEqual([nested["name"] for nested in peer["rel_device_group"]], expected)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_relationship_aliases_and_fragments(self):
+        """The same relationship field under two aliases, or in a fragment used at two depths, resolves each time."""
+        vlans, relationships, schema = self._create_vlan_relationships("alias", [Location])
+        child = Location.objects.create(
+            name="Rel Child Location",
+            location_type=LocationType.objects.get(name="Building"),
+            parent=self.location1,
+            status=self.location1.status,
+        )
+        self._associate(relationships[Location], self.location1, vlans[:2])
+        self._associate(relationships[Location], child, vlans[2:5])
+        query = """
+        query {
+            locations(name: "Rel Child Location") {
+                first: rel_alias_location_to_vlan { name }
+                second: rel_alias_location_to_vlan { name }
+                ...RelatedVLANs
+                parent { ...RelatedVLANs }
+            }
+        }
+        fragment RelatedVLANs on LocationType { rel_alias_location_to_vlan { name } }
+        """
+        result = self._execute_on_schema(schema, query)
+        self.assertIsNone(result.errors)
+        data = result.data["locations"][0]
+        child_names = [vlan.name for vlan in vlans[2:5]]
+        self.assertEqual([vlan["name"] for vlan in data["first"]], child_names)
+        self.assertEqual([vlan["name"] for vlan in data["second"]], child_names)
+        self.assertEqual([vlan["name"] for vlan in data["rel_alias_location_to_vlan"]], child_names)
+        self.assertEqual(
+            [vlan["name"] for vlan in data["parent"]["rel_alias_location_to_vlan"]], [v.name for v in vlans[:2]]
+        )
 
     @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
     def test_query_device_role_filter(self):

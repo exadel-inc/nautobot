@@ -2,7 +2,10 @@
 
 import logging
 
+from django.contrib.contenttypes.prefetch import GenericPrefetch
 from django.core.exceptions import ObjectDoesNotExist
+from django.db.models import F, Prefetch, Window
+from django.db.models.functions import RowNumber
 import graphene
 import graphene_django_optimizer as gql_optimizer
 from graphql import GraphQLError
@@ -24,6 +27,32 @@ RESOLVER_PREFIX = "resolve_"
 
 
 LIST_SEARCH_PARAMS_BY_SCHEMA_TYPE = {}
+
+PEER_POSITION = "_gql_peer_position"
+"""Annotation holding a prefetched peer's position in its model's default ordering."""
+
+
+def default_ordering_expressions(model, prefix=""):
+    """Return the default ordering of `model` as expressions, following foreign keys like `order_by()` does."""
+    expressions = []
+    for item in model._meta.ordering:
+        if not isinstance(item, str):
+            if not prefix:
+                expressions.append(item.asc() if hasattr(item, "asc") else item)
+            continue
+        name = item.removeprefix("-")
+        descending = name != item
+        field = model._meta.get_field(name) if name != "pk" and "__" not in name else None
+        related_ordering = (
+            default_ordering_expressions(field.related_model, f"{prefix}{name}__")
+            if field is not None and field.is_relation and field.related_model is not model
+            else []
+        )
+        if related_ordering:
+            expressions.extend(e.reverse_ordering() if descending else e for e in related_ordering)
+        else:
+            expressions.append(F(f"{prefix}{name}").desc() if descending else F(f"{prefix}{name}").asc())
+    return expressions
 
 
 def _graphql_selection_requests_field(info, field_name):
@@ -248,9 +277,51 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         peer_model (Model): Django Model of the peer of this relationship
     """
 
+    peer_side = RelationshipSideChoices.OPPOSITE[side]
+
+    def prefetch_attr(info):
+        """Return the attribute that holds the prefetched associations, one for each response key of the field."""
+        field_node = info.field_nodes[0]
+        return f"_gql_{resolver_name}_{(field_node.alias or field_node.name).value}"
+
+    def prefetch_hint(info, *args):
+        """Return the prefetch that loads the associations and viewable peers of all requested parent objects.
+
+        Symmetric relationships are not prefetched: their peers come from two queries that cannot be put back in
+        the default order of the peer model.
+        """
+        if relationship.symmetric:
+            return []
+        peer_queryset = peer_model.objects.all()
+        if hasattr(peer_queryset, "restrict"):
+            peer_queryset = peer_queryset.restrict(info.context.user, "view")
+        try:
+            peer_queryset = gql_optimizer.query(peer_queryset, info)
+        except (TypeError, AttributeError):
+            logger.debug("Caught an error in graphene_django_optimizer, falling back to un-optimized query")
+        ordering = default_ordering_expressions(peer_model)
+        if ordering:
+            peer_queryset = peer_queryset.annotate(**{PEER_POSITION: Window(RowNumber(), order_by=ordering)})
+        return [
+            Prefetch(
+                f"{side}_for_associations",
+                queryset=RelationshipAssociation.objects.filter(relationship=relationship).prefetch_related(
+                    GenericPrefetch(peer_side, [peer_queryset])
+                ),
+                to_attr=prefetch_attr(info),
+            )
+        ]
+
+    @gql_optimizer.resolver_hints(prefetch_related=prefetch_hint)
     def resolve_relationship(self, info, **kwargs):
         """Return a queryset or an object depending on the type of the relationship."""
-        peer_side = RelationshipSideChoices.OPPOSITE[side]
+        if not relationship.symmetric and hasattr(self, prefetch_attr(info)):
+            associations = getattr(self, prefetch_attr(info))
+            peers = [getattr(association, peer_side) for association in associations]
+            peers = sorted((peer for peer in peers if peer), key=lambda peer: getattr(peer, PEER_POSITION, 0))
+            if relationship.has_many(peer_side):
+                return peers
+            return peers[0] if peers else None
         query_params = {"relationship": relationship}
         # https://github.com/nautobot/nautobot/issues/1228
         # If querying for **only** the ID of the related object, for example:
