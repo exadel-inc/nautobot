@@ -4323,6 +4323,37 @@ class InterfaceTestCase(ViewTestCases.DeviceComponentViewTestCase):
         self.assertEqual(interface.module, module)
         self.assertEqual(interface.device, device)
 
+    def test_create_interface_on_module_of_another_device_from_device_add_url_reports_error(self):
+        """A module installed in a different device than the prefilled one is rejected with a form error."""
+        self.add_permissions("dcim.add_interface", "dcim.view_module", "extras.view_status")
+        device = Device.objects.first()
+        other_device = Device.objects.last()
+        module_bay = ModuleBay.objects.create(parent_device=other_device, name="Other Device Add Url Bay", position="1")
+        module = Module.objects.create(
+            module_type=ModuleType.objects.create(
+                manufacturer=Manufacturer.objects.first(), model="Other Device Add Url Module Type"
+            ),
+            parent_module_bay=module_bay,
+            status=Status.objects.get_for_model(Module).first(),
+        )
+
+        request = {
+            "path": self._get_url("add") + f"?device={device.pk}",
+            "data": post_data(
+                {
+                    "device": device.pk,
+                    "module": module.pk,
+                    "name_pattern": "Other Device Add Url Interface 1",
+                    "status": Status.objects.get_for_model(Interface).first().pk,
+                    "type": InterfaceTypeChoices.TYPE_1GE_FIXED,
+                }
+            ),
+        }
+        response = self.client.post(**request)
+        self.assertHttpStatus(response, 200)
+        self.assertFalse(Interface.objects.filter(name="Other Device Add Url Interface 1").exists())
+        self.assertContains(response, "Module&#x27;s assigned device differs")
+
     def test_create_interface_without_device_or_module_reports_error(self):
         """An interface belonging to neither a device nor a module is rejected rather than raising an exception."""
         self.add_permissions("dcim.add_interface", "dcim.view_module", "extras.view_status", "ipam.view_vlan")
