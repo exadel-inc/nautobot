@@ -324,3 +324,19 @@ class GetCablePkTestCase(TestCase):
     def test_get_cable_pk_uncabled_interface_returns_empty_string(self):
         self.assertIsNone(self.uncabled_interface.cable)
         self.assertEqual(get_cable_pk(self.uncabled_interface), "")
+
+    def test_get_cable_pk_breakout_child_with_uncabled_lane_returns_empty_string(self):
+        status_active = Status.objects.get_for_model(Interface).get(name="Active")
+        uncabled_lane_child = Interface.objects.create(
+            device=self.spine_interface.device,
+            name="Spine Interface 1/2",
+            type=InterfaceTypeChoices.TYPE_VIRTUAL,
+            status=status_active,
+            parent_interface=self.spine_interface,
+            breakout_position=2,
+        )
+        self.breakout_cable.terminations.get(cable_end="B", connector=2).delete()
+
+        uncabled_lane_child = Interface.objects.get(pk=uncabled_lane_child.pk)
+        self.assertIsNone(uncabled_lane_child.cable)
+        self.assertEqual(get_cable_pk(uncabled_lane_child), "")
