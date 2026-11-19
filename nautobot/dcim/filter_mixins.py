@@ -1,5 +1,6 @@
 from django.db.models import Q
 import django_filters
+from django_filters.constants import EMPTY_VALUES
 
 from nautobot.core.filters import (
     ModelMultipleChoiceFilter,
@@ -40,6 +41,37 @@ from nautobot.dcim.models import (
     RearPortTemplate,
 )
 from nautobot.extras.filter_mixins import CustomFieldModelFilterSetMixin, RelationshipModelFilterSetMixin
+
+
+class LocationSubtreeMultipleChoiceFilter(NaturalKeyOrPKMultipleChoiceFilter):
+    """Match objects in the given locations and all of their descendants.
+
+    The descendants are selected by a SQL subquery that follows `parent` up to the deepest level of the location
+    tree, so the query does not grow with the number of descendant locations.
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("queryset", Location.objects.all())
+        kwargs.setdefault("to_field_name", "name")
+        kwargs.setdefault("prefers_id", True)
+        kwargs.setdefault("label", "Location and its descendants (name or ID)")
+        super().__init__(*args, **kwargs)
+
+    def generate_query(self, value, **kwargs):
+        pks = [location.pk for location in value]
+        subtree = Q(pk__in=pks)
+        for depth in range(1, Location.objects.max_depth + 1):
+            subtree |= Q(**{f"{'parent__' * depth}in": pks})
+        locations = Location.objects.without_tree_fields().filter(subtree).values("pk")
+        return Q(**{f"{self.field_name}__in": locations})
+
+    def filter(self, qs, value):
+        if value in EMPTY_VALUES or (hasattr(value, "exists") and not value.exists()):
+            return qs
+        result = self.get_method(qs)(self.generate_query(value))
+        if self.distinct:
+            result = result.distinct()
+        return result
 
 
 class CableTerminationModelFilterSetMixin(django_filters.FilterSet):
@@ -117,6 +149,7 @@ class DeviceComponentModelFilterSetMixin(CustomFieldModelFilterSetMixin):
         to_field_name="name",
         label="Location (name or ID)",
     )
+    location_subtree = LocationSubtreeMultipleChoiceFilter(field_name="device__location")
     device = NaturalKeyOrPKMultipleChoiceFilter(
         queryset=Device.objects.all(),
         to_field_name="name",
