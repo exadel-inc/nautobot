@@ -3066,7 +3066,7 @@ query {
 
     @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
     def test_query_relationship_list_no_n_plus_one(self):
-        """A relationship field on a list costs the same number of queries as on one object plus its parent."""
+        """A relationship field on a list of objects runs the same number of queries as on a list of one object."""
         relationship = Relationship.objects.create(
             label="Location to VLANs",
             key="location_to_vlans_list",
@@ -3075,10 +3075,16 @@ query {
             type="many-to-many",
         )
         locations = list(Location.objects.all()[:4])
-        vlans_in_default_order = list(VLAN.objects.filter(pk__in=[self.vlan1.pk, self.vlan2.pk]))
+        vlan_group = VLANGroup.objects.get(name="VLANGroup 1")
+        vlan_status = Status.objects.get_for_model(VLAN).first()
+        for vid in range(301, 306):
+            VLAN.objects.create(name=f"Ordered VLAN {vid}", vid=vid, status=vlan_status, vlan_group=vlan_group)
+        vlans_in_default_order = list(VLAN.objects.filter(name__startswith="Ordered VLAN"))
         for location in locations:
-            for vlan in reversed(vlans_in_default_order):
-                RelationshipAssociation.objects.create(relationship=relationship, source=location, destination=vlan)
+            for index in [3, 0, 4, 1, 2]:
+                RelationshipAssociation.objects.create(
+                    relationship=relationship, source=location, destination=vlans_in_default_order[index]
+                )
         field = f"rel_{str_to_var_name(relationship.key)}"
         list_query = f"query {{ locations {{ id {field} {{ name }} }} }}"
         single_query = f'query {{ locations(id: "{locations[0].pk}") {{ id {field} {{ name }} }} }}'
