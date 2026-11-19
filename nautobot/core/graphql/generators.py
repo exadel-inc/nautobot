@@ -2,7 +2,10 @@
 
 import logging
 
+from django.contrib.contenttypes.prefetch import GenericPrefetch
 from django.core.exceptions import ObjectDoesNotExist
+from django.db.models import Prefetch
+from django.db.models.query import ModelIterable
 import graphene
 import graphene_django_optimizer as gql_optimizer
 from graphql import GraphQLError
@@ -237,6 +240,15 @@ def generate_computed_field_resolver(name, resolver_name):
     return resolve_computed_field
 
 
+class _PositionedModelIterable(ModelIterable):
+    """Model iterable that records the position of each row, so the queryset's own ordering can be restored."""
+
+    def __iter__(self):
+        for position, obj in enumerate(super().__iter__()):
+            obj._gql_position = position
+            yield obj
+
+
 def generate_relationship_resolver(name, resolver_name, relationship, side, peer_model):
     """Generate function to resolve each custom relationship within each DjangoObjectType.
 
@@ -248,9 +260,48 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         peer_model (Model): Django Model of the peer of this relationship
     """
 
+    peer_side = RelationshipSideChoices.OPPOSITE[side]
+    associations_accessor = f"{side}_for_associations"
+    can_prefetch = not relationship.symmetric and hasattr(
+        getattr(relationship, f"{side}_type").model_class(), associations_accessor
+    )
+
+    def prefetched_attr(info):
+        """Name of the attribute that holds the preloaded associations of this field, keyed by alias."""
+        node = info.field_nodes[0]
+        return f"_gql_{resolver_name}_{(node.alias or node.name).value}"
+
+    def prefetch_associations(info, *args):
+        """Preload the associations and permitted peers of this field for all the parents being loaded."""
+        if not can_prefetch:
+            return []
+        peer_queryset = peer_model.objects.all()
+        if hasattr(peer_queryset, "restrict"):
+            peer_queryset = peer_queryset.restrict(info.context.user, "view")
+        try:
+            peer_queryset = gql_optimizer.query(peer_queryset, info)
+        except (TypeError, AttributeError):
+            logger.debug("Caught error in graphene_django_optimizer, falling back to un-optimized query")
+        peer_queryset._iterable_class = _PositionedModelIterable
+        return [
+            Prefetch(
+                associations_accessor,
+                queryset=RelationshipAssociation.objects.filter(relationship=relationship).prefetch_related(
+                    GenericPrefetch(peer_side, [peer_queryset])
+                ),
+                to_attr=prefetched_attr(info),
+            )
+        ]
+
+    @gql_optimizer.resolver_hints(prefetch_related=prefetch_associations)
     def resolve_relationship(self, info, **kwargs):
         """Return a queryset or an object depending on the type of the relationship."""
-        peer_side = RelationshipSideChoices.OPPOSITE[side]
+        if hasattr(self, prefetched_attr(info)):
+            peers = [getattr(association, peer_side) for association in getattr(self, prefetched_attr(info))]
+            peers = sorted((peer for peer in peers if peer), key=lambda peer: peer._gql_position)
+            if relationship.has_many(peer_side):
+                return peers
+            return peers[0] if peers else None
         query_params = {"relationship": relationship}
         # https://github.com/nautobot/nautobot/issues/1228
         # If querying for **only** the ID of the related object, for example:

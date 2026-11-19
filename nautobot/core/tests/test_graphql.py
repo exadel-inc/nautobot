@@ -11,9 +11,11 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
+from django.db import connection
 from django.db.models import Count, Q
 from django.test import override_settings, tag
 from django.test.client import RequestFactory
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 import graphene.types
 from graphene_django.registry import get_global_registry
@@ -3061,6 +3063,106 @@ query {
             expected = set(device_obj.interfaces.filter(role=interface_role).values_list("name", flat=True))
             actual = {iface["name"] for iface in device_data["interfaces"]}
             self.assertEqual(actual, expected, f"Mismatch for device {device_data['name']}")
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_relationship_list_no_n_plus_one(self):
+        """A relationship field on a list costs the same number of queries as on one object plus its parent."""
+        relationship = Relationship.objects.create(
+            label="Location to VLANs",
+            key="location_to_vlans_list",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(VLAN),
+            type="many-to-many",
+        )
+        locations = list(Location.objects.all()[:4])
+        for location in locations:
+            for vlan in (self.vlan1, self.vlan2):
+                RelationshipAssociation.objects.create(relationship=relationship, source=location, destination=vlan)
+        field = f"rel_{str_to_var_name(relationship.key)}"
+        list_query = f"query {{ locations {{ id {field} {{ name }} }} }}"
+        single_query = f'query {{ locations(id: "{locations[0].pk}") {{ id {field} {{ name }} }} }}'
+        schema = rebuild_graphql_schema().graphql_schema
+
+        with CaptureQueriesContext(connection) as list_queries:
+            result = execute(schema=schema, document=parse(list_query), context_value=self.request)
+        with CaptureQueriesContext(connection) as single_queries:
+            execute(schema=schema, document=parse(single_query), context_value=self.request)
+
+        self.assertIsNone(result.errors)
+        self.assertEqual(len(list_queries), len(single_queries))
+        by_id = {item["id"]: item[field] for item in result.data["locations"]}
+        for location in locations:
+            self.assertCountEqual(
+                [vlan["name"] for vlan in by_id[str(location.pk)]], [self.vlan1.name, self.vlan2.name]
+            )
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_relationship_aliases_return_separate_results(self):
+        """Two aliases of one relationship field on the same objects each return their own selection."""
+        relationship = Relationship.objects.create(
+            label="Location to VLANs",
+            key="location_to_vlans_alias",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(VLAN),
+            type="many-to-many",
+        )
+        RelationshipAssociation.objects.create(relationship=relationship, source=self.location1, destination=self.vlan1)
+        field = f"rel_{str_to_var_name(relationship.key)}"
+        query = f'query {{ locations(id: "{self.location1.pk}") {{ first: {field} {{ name }} second: {field} {{ vid }} }} }}'
+
+        result = execute_query_on_rebuilt_schema(query, request=self.request)
+
+        self.assertIsNone(result.errors)
+        self.assertEqual(
+            result.data["locations"], [{"first": [{"name": self.vlan1.name}], "second": [{"vid": self.vlan1.vid}]}]
+        )
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_relationship_nested_single_object_query_count(self):
+        """Relationship fields nested under one device load only the requested objects, in a fixed number of queries."""
+        vlan_ct = ContentType.objects.get_for_model(VLAN)
+        relationships = {
+            model: Relationship.objects.create(
+                label=f"{model.__name__} to VLANs",
+                key=f"{model.__name__.lower()}_to_vlans_nested",
+                source_type=ContentType.objects.get_for_model(model),
+                destination_type=vlan_ct,
+                type="many-to-many",
+            )
+            for model in (Device, Location, VRF)
+        }
+        vrf = VRF.objects.create(name="Nested VRF", namespace=self.namespace)
+        VRFDeviceAssignment.objects.create(vrf=vrf, device=self.device1)
+        unrelated_vrf = VRF.objects.create(name="Unrelated VRF", namespace=self.namespace)
+        wanted = {Device: self.device1, Location: self.location1, VRF: vrf}
+        unrelated = [self.device2, self.location2, unrelated_vrf]
+        for obj in [*wanted.values(), *unrelated]:
+            RelationshipAssociation.objects.create(
+                relationship=relationships[type(obj)], source=obj, destination=self.vlan1
+            )
+        RelationshipAssociation.objects.create(
+            relationship=relationships[Device], source=self.device2, destination=self.vlan2
+        )
+
+        def field(model):
+            return f"rel_{str_to_var_name(relationships[model].key)}"
+
+        query = (
+            f'query {{ device(id: "{self.device1.pk}") {{ {field(Device)} {{ name }} '
+            f"location {{ {field(Location)} {{ name }} }} vrfs {{ {field(VRF)} {{ name }} }} }} }}"
+        )
+        schema = rebuild_graphql_schema().graphql_schema
+        with CaptureQueriesContext(connection) as queries:
+            result = execute(schema=schema, document=parse(query), context_value=self.request)
+
+        self.assertIsNone(result.errors)
+        self.assertEqual(result.data["device"][field(Device)], [{"name": self.vlan1.name}])
+        self.assertEqual(result.data["device"]["location"][field(Location)], [{"name": self.vlan1.name}])
+        self.assertEqual(result.data["device"]["vrfs"], [{field(VRF): [{"name": self.vlan1.name}]}])
+        self.assertEqual(len(queries), 8)
+        captured_sql = " ".join(q["sql"] for q in queries).replace("-", "")
+        for obj in [*unrelated, self.vlan2]:
+            self.assertNotIn(obj.pk.hex, captured_sql)
 
 
 class GraphQLTypeTestCase(UnitTestTestCase):
