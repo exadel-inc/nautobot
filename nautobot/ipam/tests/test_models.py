@@ -2496,6 +2496,50 @@ class TestIPAddress(ModelTestCases.BaseModelTestCase):
         ip.validated_save()
         self.assertTrue(IPAddress.objects.filter(host="10.0.0.75").exists())
 
+    def test_dns_name_valid(self):
+        dns_names = [
+            "host.example",
+            "host-1.example.com",
+            "1host.example",
+            "xn--bcher-kva.example",
+            "example.com.",
+            "a",
+            "HOST.Example",
+            "",
+        ]
+        for index, dns_name in enumerate(dns_names, start=1):
+            with self.subTest(dns_name=dns_name):
+                ip = IPAddress(
+                    address=f"192.0.2.{index}/24", status=self.status, namespace=self.namespace, dns_name=dns_name
+                )
+                ip.validated_save()
+                ip.refresh_from_db()
+                self.assertEqual(ip.dns_name, dns_name.lower())
+
+    def test_dns_name_invalid(self):
+        dns_names = [
+            "whatever-.your.tld",
+            "-host.example",
+            "host.-example",
+            "host_name.example",
+            "_srv.example",
+            "host..example",
+        ]
+        for index, dns_name in enumerate(dns_names, start=1):
+            with self.subTest(dns_name=dns_name):
+                ip = IPAddress(
+                    address=f"192.0.2.{index}/24", status=self.status, namespace=self.namespace, dns_name=dns_name
+                )
+                with self.assertRaises(ValidationError) as cm:
+                    ip.validated_save()
+                self.assertEqual(
+                    cm.exception.message_dict["dns_name"],
+                    [
+                        "Only alphanumeric characters, hyphens, and periods are allowed in DNS names, "
+                        "and each label must start and end with a letter or digit"
+                    ],
+                )
+
 
 class TestIPAddressRange(ModelTestCases.BaseModelTestCase):
     model = IPAddressRange
