@@ -3,8 +3,8 @@
 import logging
 
 from django.contrib.contenttypes.prefetch import GenericPrefetch
-from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import F, Prefetch, Window
+from django.core.exceptions import FieldError, ObjectDoesNotExist
+from django.db.models import F, OrderBy, Prefetch, Window
 from django.db.models.functions import RowNumber
 import graphene
 import graphene_django_optimizer as gql_optimizer
@@ -32,24 +32,26 @@ PEER_POSITION = "_gql_peer_position"
 """Annotation holding a prefetched peer's position in its model's default ordering."""
 
 
-def default_ordering_expressions(model, prefix=""):
-    """Return the default ordering of `model` as expressions, following foreign keys like `order_by()` does."""
+def default_ordering_expressions(model, prefix="", models_seen=frozenset()):
+    """Return the default ordering of `model` as expressions, expanding related models like `order_by()` does."""
+    if model in models_seen:
+        raise FieldError("Infinite loop caused by ordering.")
     expressions = []
     for item in model._meta.ordering:
-        if not isinstance(item, str):
-            if not prefix:
-                expressions.append(item.asc() if hasattr(item, "asc") else item)
+        if hasattr(item, "resolve_expression"):
+            item = item if isinstance(item, OrderBy) else item.asc()
+            expressions.append(item.prefix_references(prefix) if prefix else item)
             continue
         name = item.removeprefix("-")
         descending = name != item
-        field = model._meta.get_field(name) if name != "pk" and "__" not in name else None
-        related_ordering = (
-            default_ordering_expressions(field.related_model, f"{prefix}{name}__")
-            if field is not None and field.is_relation and field.related_model is not model
-            else []
-        )
-        if related_ordering:
-            expressions.extend(e.reverse_ordering() if descending else e for e in related_ordering)
+        *path, last = name.split("__")
+        owner = model
+        for piece in path:
+            owner = owner._meta.get_field(piece).related_model
+        field = owner._meta.pk if last == "pk" else owner._meta.get_field(last)
+        if field.is_relation and field.related_model._meta.ordering and field.attname != last and name != "pk":
+            related = default_ordering_expressions(field.related_model, f"{prefix}{name}__", models_seen | {model})
+            expressions.extend(e.reverse_ordering() if descending else e for e in related)
         else:
             expressions.append(F(f"{prefix}{name}").desc() if descending else F(f"{prefix}{name}").asc())
     return expressions

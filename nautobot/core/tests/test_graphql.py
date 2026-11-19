@@ -2143,7 +2143,7 @@ query {
         for vrf_data in device_data["vrfs"]:
             self.assertEqual([vlan["name"] for vlan in vrf_data["rel_nested_vrf_to_vlan"]], expected)
 
-        self.assertLessEqual(len(queries), 6)
+        self.assertEqual(len(queries), 6)
         uuid_pattern = re.compile(r"[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}")
         association_table = RelationshipAssociation._meta.db_table
         vlan_table = VLAN._meta.db_table
@@ -2159,14 +2159,63 @@ query {
     @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
     def test_query_relationship_nested_peer_same_model_as_root(self):
         """A nested peer of the same model as the root is not limited to the root objects."""
-        query = 'query { devices(name: "Device 1") { rel_device_group { name rel_device_group { name } } } }'
-        result = execute_query_on_rebuilt_schema(query, request=self.request)
+        relationship = Relationship(
+            label="Device to Device",
+            key="samemodel_device_to_device",
+            source_type=ContentType.objects.get_for_model(Device),
+            destination_type=ContentType.objects.get_for_model(Device),
+            type="many-to-many",
+        )
+        relationship.validated_save()
+        for source, destination in [(self.device1, self.device2), (self.device2, self.device3)]:
+            RelationshipAssociation.objects.create(relationship=relationship, source=source, destination=destination)
+        schema = rebuild_graphql_schema().graphql_schema
+        query = """
+        query {
+            devices(name: "Device 1") {
+                rel_samemodel_device_to_device_destination { name rel_samemodel_device_to_device_destination { name } }
+            }
+        }
+        """
+        result = self._execute_on_schema(schema, query)
         self.assertIsNone(result.errors)
-        peers = result.data["devices"][0]["rel_device_group"]
-        self.assertEqual([peer["name"] for peer in peers], ["Device 2", "Device 3"])
-        for peer in peers:
-            expected = sorted({"Device 1", "Device 2", "Device 3"} - {peer["name"]})
-            self.assertEqual([nested["name"] for nested in peer["rel_device_group"]], expected)
+        peers = result.data["devices"][0]["rel_samemodel_device_to_device_destination"]
+        self.assertEqual([peer["name"] for peer in peers], ["Device 2"])
+        self.assertEqual(
+            [nested["name"] for nested in peers[0]["rel_samemodel_device_to_device_destination"]], ["Device 3"]
+        )
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_relationship_peers_in_default_ordering_of_peer_model(self):
+        """Peers of a model that is ordered by a foreign key id and an expression come back in its default order."""
+        relationship = Relationship(
+            label="Location to Interface",
+            key="ordering_location_to_interface",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(Interface),
+            type="many-to-many",
+        )
+        relationship.validated_save()
+        interfaces = []
+        for device in (self.device2, self.device1):
+            for name in ("eth10", "eth2", "eth1"):
+                interface = Interface(device=device, name=name, status=self.device_statuses[0])
+                interface.type = "1000base-t"
+                interface.validated_save()
+                interfaces.append(interface)
+        for interface in reversed(Interface.objects.filter(pk__in=[i.pk for i in interfaces])):
+            RelationshipAssociation.objects.create(
+                relationship=relationship, source=self.location1, destination=interface
+            )
+        schema = rebuild_graphql_schema().graphql_schema
+        query = 'query { locations(name: "%s") { rel_ordering_location_to_interface { id } } }' % self.location1.name
+        result = self._execute_on_schema(schema, query)
+        self.assertIsNone(result.errors)
+        expected = [
+            str(pk) for pk in Interface.objects.filter(pk__in=[i.pk for i in interfaces]).values_list("pk", flat=True)
+        ]
+        peers = result.data["locations"][0]["rel_ordering_location_to_interface"]
+        self.assertEqual([peer["id"] for peer in peers], expected)
 
     @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
     def test_query_relationship_aliases_and_fragments(self):
