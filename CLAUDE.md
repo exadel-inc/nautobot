@@ -36,6 +36,10 @@ These are the UI end-to-end tests under `nautobot/*/tests/integration/`. CI runs
 
 - **For a UI bug fix:** add or extend an integration test that reproduces the bug when one is
   feasible, and run it before and after the fix.
+- **Enforced by a hook:** in the agent container, the Stop hook in `.claude/settings.json`
+  (`.claude/hooks/require_integration_tests.py`) blocks finishing once when the branch changes
+  web-UI code and no `--tag integration` run happened in the session. Outside that container
+  it does nothing.
 - **Avoid the full suite:** `--tag integration` with no label runs all of it, which takes a long
   time. Use labels.
 
