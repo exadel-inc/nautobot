@@ -973,7 +973,7 @@ class DeviceComponentTestMixin:
         common_test_data(cls)
 
     def test_location_subtree(self):
-        component = self.queryset.first()
+        component = self.queryset.filter(device__isnull=False).first()
         campus = component.device.location
         floor = create_descendant_location(self, campus)
         Device.objects.filter(pk=component.device.pk).update(location=floor)
