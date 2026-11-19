@@ -58,7 +58,7 @@ class LocationSubtreeMultipleChoiceFilter(NaturalKeyOrPKMultipleChoiceFilter):
         super().__init__(*args, **kwargs)
 
     def generate_query(self, value, **kwargs):
-        pks = [location.pk for location in value]
+        pks = [getattr(location, "pk", location) for location in value]
         subtree = Q(pk__in=pks)
         for depth in range(1, Location.objects.max_depth + 1):
             subtree |= Q(**{f"{'parent__' * depth}in": pks})
@@ -66,7 +66,10 @@ class LocationSubtreeMultipleChoiceFilter(NaturalKeyOrPKMultipleChoiceFilter):
         return Q(**{f"{self.field_name}__in": locations})
 
     def filter(self, qs, value):
-        if value in EMPTY_VALUES or (hasattr(value, "exists") and not value.exists()):
+        if value in EMPTY_VALUES:
+            return qs
+        value = list(value)
+        if not value:
             return qs
         result = self.get_method(qs)(self.generate_query(value))
         if self.distinct:

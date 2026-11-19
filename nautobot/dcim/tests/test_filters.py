@@ -3297,18 +3297,40 @@ class InventoryItemTestCase(DeviceComponentTestMixin, FilterTestCases.FilterTest
         return campus, floor
 
     def test_location_subtree(self):
-        _, floor = self._move_device_to_descendant_location()
-        building = floor.parent
-        expected = self.queryset.filter(device__location=floor)
-        self.assertTrue(expected.exists())
+        campus, floor = self._move_device_to_descendant_location()
+        expected = self.queryset.filter(device__location__in=[campus, floor])
+        self.assertTrue(expected.filter(device__location=campus).exists())
+        self.assertTrue(expected.filter(device__location=floor).exists())
         with self.subTest("location_subtree: name"):
             self.assertQuerySetEqual(
-                self.filterset({"location_subtree": [building.name]}, self.queryset).qs, expected, ordered=False
+                self.filterset({"location_subtree": [campus.name]}, self.queryset).qs, expected, ordered=False
             )
         with self.subTest("location_subtree: ID"):
             self.assertQuerySetEqual(
-                self.filterset({"location_subtree": [building.pk]}, self.queryset).qs, expected, ordered=False
+                self.filterset({"location_subtree": [campus.pk]}, self.queryset).qs, expected, ordered=False
             )
+
+    def test_location_subtree_multiple_values(self):
+        _, floor = self._move_device_to_descendant_location()
+        other = Device.objects.get(name="Device 2").location
+        expected = self.queryset.filter(device__location__in=[floor, other])
+        self.assertQuerySetEqual(
+            self.filterset({"location_subtree": [floor.parent.pk, other.pk]}, self.queryset).qs,
+            expected,
+            ordered=False,
+        )
+
+    def test_location_subtree_unknown_name(self):
+        self.assertFalse(self.filterset({"location_subtree": ["No Such Location"]}, self.queryset).is_valid())
+
+    def test_location_subtree_generate_query_accepts_id_strings(self):
+        campus, floor = self._move_device_to_descendant_location()
+        query = self.filterset({}, self.queryset).filters["location_subtree"].generate_query([str(campus.pk)])
+        self.assertQuerySetEqual(
+            self.queryset.filter(query),
+            self.queryset.filter(device__location__in=[campus, floor]),
+            ordered=False,
+        )
 
     def test_location_is_exact(self):
         campus, floor = self._move_device_to_descendant_location()
