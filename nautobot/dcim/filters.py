@@ -49,6 +49,7 @@ from nautobot.dcim.filter_mixins import (
     DeviceModuleCommonFiltersMixin,
     DeviceTypeModuleTypeCommonFiltersMixin,
     LocatableModelFilterSetMixin,
+    LocationSubtreeMultipleChoiceFilter,
     ModularDeviceComponentModelFilterSetMixin,
     ModularDeviceComponentTemplateModelFilterSetMixin,
     PathEndpointModelFilterSetMixin,
@@ -1435,6 +1436,7 @@ class VirtualChassisFilterSet(NautobotFilterSet):
         to_field_name="name",
         label="Location (name or ID)",
     )
+    location_subtree = LocationSubtreeMultipleChoiceFilter(field_name="master__location")
     tenant = NaturalKeyOrPKMultipleChoiceFilter(
         field_name="master__tenant",
         queryset=Tenant.objects.all(),
@@ -1812,6 +1814,7 @@ class ConsoleConnectionFilterSet(ConnectionFilterSetMixin, BaseFilterSet):
         method="filter_location",
         label="Location (name)",
     )
+    location_subtree = LocationSubtreeMultipleChoiceFilter(field_name="device__location")
     device_id = MultiValueUUIDFilter(method="filter_device", label="Device (ID)")
     device = MultiValueCharFilter(method="filter_device", field_name="device__name", label="Device (name)")
 
@@ -1831,6 +1834,7 @@ class PowerConnectionFilterSet(ConnectionFilterSetMixin, BaseFilterSet):
         method="filter_location",
         label="Location (name)",
     )
+    location_subtree = LocationSubtreeMultipleChoiceFilter(field_name="device__location")
     device_id = MultiValueUUIDFilter(method="filter_device", label="Device (ID)")
     device = MultiValueCharFilter(method="filter_device", field_name="device__name", label="Device (name)")
 
@@ -1850,6 +1854,9 @@ class InterfaceConnectionFilterSet(BaseFilterSet):
 
     q = django_filters.CharFilter(method="search", label="Search")
     location = django_filters.CharFilter(method="filter_location", label="Location (name)")
+    location_subtree = LocationSubtreeMultipleChoiceFilter(
+        field_name="device__location", method="filter_location_subtree"
+    )
     device_id = MultiValueUUIDFilter(method="filter_device_id", label="Device (ID)")
     device = MultiValueCharFilter(method="filter_device_name", label="Device (name)")
 
@@ -1873,6 +1880,11 @@ class InterfaceConnectionFilterSet(BaseFilterSet):
         if not value.strip():
             return queryset
         return self._filter_either_endpoint(queryset, Q(device__location__name=value))
+
+    def filter_location_subtree(self, queryset, name, value):
+        if not value:
+            return queryset
+        return self._filter_either_endpoint(queryset, self.filters["location_subtree"].generate_query(value))
 
     def filter_device_id(self, queryset, name, value):
         return self._filter_either_endpoint(queryset, Q(device_id__in=value))
