@@ -75,11 +75,8 @@ def get_cable_pk(record):
     """Given an interface, try to return its cable's primary key."""
     if record.cable:
         return record.cable.pk
-    if (
-        record.parent_interface_id
-        and record.breakout_position is not None
-        and record.parent_interface.cable is not None
-    ):
+    lane = record.get_breakout_lane() if record.parent_interface_id else None
+    if lane and lane.far_termination:
         return record.parent_interface.cable.pk
     return ""
 

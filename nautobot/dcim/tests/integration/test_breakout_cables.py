@@ -114,6 +114,41 @@ class BreakoutCablesTestCase(SeleniumTestCase):
                 f"{child.name} row is still green after toggling the parent cable",
             )
 
+    def test_device_detail_view_interface_tab_uncabled_child_color_unchanged_after_cable_toggled(self):
+        _, spine_device, spine_interface, spine_interface_children, _, leaf_interfaces = (
+            self.create_1x2_breakout_cable()
+        )
+        cabled_child, uncabled_child = spine_interface_children
+        leaf_interfaces[1].cable_termination.delete()
+
+        self.browser.visit(self.live_server_url + reverse("dcim:device_interfaces", kwargs={"pk": spine_device.pk}))
+
+        self.assertTrue(
+            self.browser.is_element_present_by_css(f'tr[data-name="{cabled_child.name}"].table-success', wait_time=10),
+            f"{cabled_child.name} row did not start green",
+        )
+        toggle = WebDriverWait(self.browser.driver, 10).until(
+            expected_conditions.presence_of_element_located(
+                (By.CSS_SELECTOR, f'tr[data-name="{spine_interface.name}"] a.cable-toggle')
+            )
+        )
+
+        for toggled_class in ("table-info", "table-success"):
+            self.browser.driver.execute_script("arguments[0].click();", toggle)
+            self.assertTrue(
+                self.browser.is_element_present_by_css(
+                    f'tr[data-name="{cabled_child.name}"].{toggled_class}', wait_time=10
+                ),
+                f"{cabled_child.name} row did not get {toggled_class} after toggling the parent cable",
+            )
+            for css_class in ("table-info", "table-success"):
+                self.assertFalse(
+                    self.browser.is_element_present_by_css(
+                        f'tr[data-name="{uncabled_child.name}"].{css_class}', wait_time=1
+                    ),
+                    f"{uncabled_child.name} row got {css_class} after toggling the parent cable",
+                )
+
     def test_device_detail_view_interface_tab_icons_change_after_cable_toggled_from_connected_to_planned(self):
         _, _, _, _, leaf_device, leaf_interfaces = self.create_1x2_breakout_cable()
 
