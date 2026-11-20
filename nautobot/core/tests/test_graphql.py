@@ -11,9 +11,11 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
+from django.db import connection
 from django.db.models import Count, Q
 from django.test import override_settings, tag
 from django.test.client import RequestFactory
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 import graphene.types
 from graphene_django.registry import get_global_registry
@@ -731,6 +733,394 @@ class GraphQLRelatedObjectPermissionTest(GraphQLTestCaseBase):
             "Wrap each with permission_safe_resolver / permission_safe_attribute_resolver (or allow-list with "
             "justification):\n" + "\n".join(sorted(unenforced)),
         )
+
+
+class GraphQLRelationshipQueryCountTest(GraphQLTestCaseBase):
+    """Relationship (`rel_*`) fields must not issue per-parent-object queries (#8599)."""
+
+    SMALL = 3
+    LARGE = 12
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create(username="rel_count_user", is_active=True)
+        location_type = LocationType.objects.get(name="Campus")
+        location_status = Status.objects.get_for_model(Location)[0]
+        vlan_status = Status.objects.get_for_model(VLAN)[0]
+
+        cls.m2m = Relationship.objects.create(
+            label="Batch Location to VLANs",
+            key="batch_location_to_vlans",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(VLAN),
+            type="many-to-many",
+        )
+        cls.symmetric = Relationship.objects.create(
+            label="Batch VLAN peers",
+            key="batch_vlan_peers",
+            source_type=ContentType.objects.get_for_model(VLAN),
+            destination_type=ContentType.objects.get_for_model(VLAN),
+            type="symmetric-many-to-many",
+        )
+        cls.one_to_many = Relationship.objects.create(
+            label="Batch Location owns VLAN",
+            key="batch_location_owns_vlan",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(VLAN),
+            type="one-to-many",
+        )
+
+        cls.vlan_vid = 3500
+        cls.vlans = {}
+        cls.locations = {}
+        for group, count in (("Small", cls.SMALL), ("Large", cls.LARGE)):
+            cls.locations[group] = [
+                Location.objects.create(
+                    name=f"RelBatch{group} Loc {i}", location_type=location_type, status=location_status
+                )
+                for i in range(count)
+            ]
+            cls.vlans[group] = []
+            for i in range(count):
+                cls.vlan_vid += 1
+                cls.vlans[group].append(
+                    VLAN.objects.create(name=f"RelBatch{group} VLAN {i}", vid=cls.vlan_vid, status=vlan_status)
+                )
+            for i in range(count):
+                loc = cls.locations[group][i]
+                # Each location gets two VLANs (many-to-many); consecutive locations share a VLAN.
+                for vlan in (cls.vlans[group][i], cls.vlans[group][(i + 1) % count]):
+                    RelationshipAssociation.objects.create(relationship=cls.m2m, source=loc, destination=vlan)
+                # Symmetric: each VLAN peers with the next one.
+                RelationshipAssociation.objects.create(
+                    relationship=cls.symmetric,
+                    source=cls.vlans[group][i],
+                    destination=cls.vlans[group][(i + 1) % count],
+                )
+                # One-to-many: each location owns exactly one VLAN.
+                RelationshipAssociation.objects.create(
+                    relationship=cls.one_to_many, source=loc, destination=cls.vlans[group][i]
+                )
+
+    @staticmethod
+    def _grant_view(user, model, constraints=None):
+        obj_perm = ObjectPermission.objects.create(
+            name=f"View {model._meta.label} for {user.username} ({constraints})",
+            actions=["view"],
+            constraints=constraints or {},
+        )
+        obj_perm.object_types.add(ContentType.objects.get_for_model(model))
+        obj_perm.users.add(user)
+
+    def _run(self, schema, query, user):
+        request = RequestFactory().post("/graphql/")
+        request.user = user
+        with CaptureQueriesContext(connection) as ctx:
+            result = execute(schema=schema.graphql_schema, document=parse(query), context_value=request)
+        self.assertIsNone(result.errors)
+        return result.data, len(ctx)
+
+    def _assert_constant_queries(self, root_field, rel_key, user=None):
+        """Query the same field for SMALL and LARGE sets of parents and compare the query counts."""
+        user = user or self.user
+        schema = rebuild_graphql_schema()
+        field = f"rel_{str_to_var_name(rel_key)}"
+        counts = {}
+        data = {}
+        # Warm up per-user permission caches so they don't skew the comparison.
+        self._run(schema, f'query {{ {root_field}(name__ic: "RelBatchWarmup") {{ name }} }}', user)
+        for group in ("Small", "Large"):
+            query = f'query {{ {root_field}(name__ic: "RelBatch{group}") {{ name {field} {{ name }} }} }}'
+            data[group], counts[group] = self._run(schema, query, user)
+        self.assertEqual(len(data["Small"][root_field]), self.SMALL)
+        self.assertEqual(len(data["Large"][root_field]), self.LARGE)
+        self.assertEqual(counts["Small"], counts["Large"], f"Query count grew with number of objects: {counts}")
+        return data
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_many_to_many_source_side(self):
+        data = self._assert_constant_queries("locations", "batch_location_to_vlans")
+        for loc in data["Large"]["locations"]:
+            i = int(loc["name"].rsplit(" ", 1)[1])
+            expected = {f"RelBatchLarge VLAN {i}", f"RelBatchLarge VLAN {(i + 1) % self.LARGE}"}
+            self.assertIsInstance(loc["rel_batch_location_to_vlans"], list)
+            self.assertEqual({v["name"] for v in loc["rel_batch_location_to_vlans"]}, expected)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_many_to_many_destination_side(self):
+        data = self._assert_constant_queries("vlans", "batch_location_to_vlans")
+        for vlan in data["Large"]["vlans"]:
+            i = int(vlan["name"].rsplit(" ", 1)[1])
+            expected = {f"RelBatchLarge Loc {i}", f"RelBatchLarge Loc {(i - 1) % self.LARGE}"}
+            self.assertEqual({v["name"] for v in vlan["rel_batch_location_to_vlans"]}, expected)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_symmetric(self):
+        data = self._assert_constant_queries("vlans", "batch_vlan_peers")
+        for vlan in data["Large"]["vlans"]:
+            i = int(vlan["name"].rsplit(" ", 1)[1])
+            expected = {f"RelBatchLarge VLAN {(i + 1) % self.LARGE}", f"RelBatchLarge VLAN {(i - 1) % self.LARGE}"}
+            self.assertEqual({v["name"] for v in vlan["rel_batch_vlan_peers"]}, expected)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_single_peer_cardinality(self):
+        """The "one" side returns an object, the "many" side a list; missing peers give null."""
+        schema = rebuild_graphql_schema()
+        # Location is source of one-to-many: it has many VLANs; VLAN has a single Location.
+        query = (
+            'query { vlans(name__ic: "RelBatchLarge") { name rel_batch_location_owns_vlan { name } } '
+            'locations(name__ic: "RelBatchLarge") { name rel_batch_location_owns_vlan { name } } }'
+        )
+        data, _ = self._run(schema, query, self.user)
+        for vlan in data["vlans"]:
+            i = int(vlan["name"].rsplit(" ", 1)[1])
+            self.assertEqual(vlan["rel_batch_location_owns_vlan"], {"name": f"RelBatchLarge Loc {i}"})
+        for loc in data["locations"]:
+            self.assertIsInstance(loc["rel_batch_location_owns_vlan"], list)
+            self.assertEqual(len(loc["rel_batch_location_owns_vlan"]), 1)
+        # A VLAN with no association yields null.
+        VLAN.objects.create(name="RelBatchOrphan VLAN", vid=3999, status=Status.objects.get_for_model(VLAN)[0])
+        data, _ = self._run(
+            schema, 'query { vlans(name__ic: "RelBatchOrphan") { rel_batch_location_owns_vlan { name } } }', self.user
+        )
+        self.assertEqual(data["vlans"], [{"rel_batch_location_owns_vlan": None}])
+
+    def test_constrained_user_sees_only_permitted_peers_without_n_plus_one(self):
+        self._grant_view(self.user, Location)
+        self._grant_view(self.user, VLAN, {"name__regex": r"VLAN (0|2|4|6|8|10)$"})
+        data = self._assert_constant_queries("locations", "batch_location_to_vlans")
+        for loc in data["Large"]["locations"]:
+            i = int(loc["name"].rsplit(" ", 1)[1])
+            expected = {f"RelBatchLarge VLAN {n}" for n in (i, (i + 1) % self.LARGE) if n % 2 == 0}
+            self.assertEqual({v["name"] for v in loc["rel_batch_location_to_vlans"]}, expected)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_single_object_query_count_unchanged(self):
+        """A single-object query must not bulk-load every association of the relationship."""
+        schema = rebuild_graphql_schema()
+        loc = self.locations["Large"][0]
+        query = f'query {{ location(id: "{loc.pk}") {{ rel_batch_location_to_vlans {{ name }} }} }}'
+        data, count = self._run(schema, query, self.user)
+        self.assertEqual(len(data["location"]["rel_batch_location_to_vlans"]), 2)
+        # One query for the location, one for the peers (associations are a subquery of it).
+        self.assertEqual(count, 2)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_peer_order_matches_peer_queryset_order(self):
+        """First-call (queryset) and bulk (list) paths return peers in the peer model's queryset order."""
+        schema = rebuild_graphql_schema()
+        data, _ = self._run(
+            schema,
+            'query { locations(name__ic: "RelBatchLarge") { id rel_batch_location_to_vlans { id } } }',
+            self.user,
+        )
+        for loc in data["locations"]:
+            ids = [v["id"] for v in loc["rel_batch_location_to_vlans"]]
+            expected = [str(pk) for pk in VLAN.objects.filter(pk__in=ids).values_list("pk", flat=True)]
+            self.assertEqual(ids, expected)
+        first = data["locations"][0]
+        single, _ = self._run(
+            schema, f'query {{ location(id: "{first["id"]}") {{ rel_batch_location_to_vlans {{ id }} }} }}', self.user
+        )
+        self.assertEqual(single["location"]["rel_batch_location_to_vlans"], first["rel_batch_location_to_vlans"])
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_cache_not_reused_across_executions_of_same_request(self):
+        """A second execution with the same request object must not see peers cached by the first."""
+        schema = rebuild_graphql_schema()
+        request = RequestFactory().post("/graphql/")
+        request.user = self.user
+        query = 'query { locations(name__ic: "RelBatchSmall") { name rel_batch_location_to_vlans { name } } }'
+        first = execute(schema=schema.graphql_schema, document=parse(query), context_value=request)
+        self.assertIsNone(first.errors)
+        RelationshipAssociation.objects.filter(relationship=self.m2m, source_id=self.locations["Small"][0].pk).delete()
+        second = execute(schema=schema.graphql_schema, document=parse(query), context_value=request)
+        self.assertIsNone(second.errors)
+        by_name = {loc["name"]: loc for loc in second.data["locations"]}
+        self.assertEqual(by_name["RelBatchSmall Loc 0"]["rel_batch_location_to_vlans"], [])
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_bulk_query_scoped_to_requested_parents(self):
+        """The bulk association lookup must filter by the queried parents, not load the whole relationship.
+
+        A constant query *count* (as asserted elsewhere in this class) doesn't catch a query that stays at one
+        execution but scans every association of the relationship; this inspects the query's SQL instead.
+        """
+        location_type = LocationType.objects.get(name="Campus")
+        location_status = Status.objects.get_for_model(Location)[0]
+        vlan_status = Status.objects.get_for_model(VLAN)[0]
+        unrelated_locations = [
+            Location.objects.create(
+                name=f"RelBatchUnrelated Loc {i}", location_type=location_type, status=location_status
+            )
+            for i in range(200)
+        ]
+        for i, loc in enumerate(unrelated_locations):
+            vlan = VLAN.objects.create(name=f"RelBatchUnrelated VLAN {i}", vid=4500 + i, status=vlan_status)
+            RelationshipAssociation.objects.create(relationship=self.m2m, source=loc, destination=vlan)
+
+        schema = rebuild_graphql_schema()
+        request = RequestFactory().post("/graphql/")
+        request.user = self.user
+        query = 'query { locations(name__ic: "RelBatchSmall") { name rel_batch_location_to_vlans { name } } }'
+        with CaptureQueriesContext(connection) as ctx:
+            result = execute(schema=schema.graphql_schema, document=parse(query), context_value=request)
+        self.assertIsNone(result.errors)
+
+        # The bulk lookup selects both columns straight off the association table (unlike the single-parent
+        # path's per-object subquery, which selects only one column and is embedded inside the peer query).
+        destination_id = connection.ops.quote_name("destination_id")
+        association_table = connection.ops.quote_name("extras_relationshipassociation")
+        bulk_queries = [
+            q["sql"] for q in ctx.captured_queries if f"AS {destination_id} FROM {association_table}" in q["sql"]
+        ]
+        self.assertTrue(bulk_queries, "Expected to find the bulk association lookup query")
+        for sql in bulk_queries:
+            self.assertIn("IN (", sql)
+            for loc in unrelated_locations:
+                self.assertNotIn(str(loc.pk), sql)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_nested_relationship_of_same_model_not_scoped_to_outer_root(self):
+        """A relationship nested inside another occurrence of itself must resolve its own peers, not the outer root's."""
+        location_type = LocationType.objects.get(name="Campus")
+        location_status = Status.objects.get_for_model(Location)[0]
+        self_ref = Relationship.objects.create(
+            label="Batch Nested Self Ref",
+            key="batch_nested_self_ref",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(Location),
+            type="many-to-many",
+        )
+        names = [
+            "RelNestedRoot A",
+            "RelNestedRoot B",
+            "RelNestedPeer A1",
+            "RelNestedPeer B1",
+            "RelNestedLeaf A2",
+            "RelNestedLeaf B2",
+        ]
+        root_a, root_b, peer_a1, peer_b1, leaf_a2, leaf_b2 = (
+            Location.objects.create(name=name, location_type=location_type, status=location_status) for name in names
+        )
+        # Each root has exactly one peer, and each of those peers has exactly one peer of their own (a different
+        # object than either root). If the inner field were wrongly scoped to the outer roots, it would miss these.
+        RelationshipAssociation.objects.create(relationship=self_ref, source=root_a, destination=peer_a1)
+        RelationshipAssociation.objects.create(relationship=self_ref, source=root_b, destination=peer_b1)
+        RelationshipAssociation.objects.create(relationship=self_ref, source=peer_a1, destination=leaf_a2)
+        RelationshipAssociation.objects.create(relationship=self_ref, source=peer_b1, destination=leaf_b2)
+
+        schema = rebuild_graphql_schema()
+        # Filtered to match only the two roots: a broader filter matching the peers/leaves too would let the
+        # root-scoped bulk query incidentally include them, masking the bug this test is meant to catch.
+        query = (
+            'query { locations(name__ic: "RelNestedRoot") { name rel_batch_nested_self_ref_destination '
+            "{ name rel_batch_nested_self_ref_destination { name } } } }"
+        )
+        data, _ = self._run(schema, query, self.user)
+        by_name = {loc["name"]: loc for loc in data["locations"]}
+        self.assertEqual(
+            {p["name"] for p in by_name["RelNestedRoot A"]["rel_batch_nested_self_ref_destination"]},
+            {"RelNestedPeer A1"},
+        )
+        self.assertEqual(
+            {p["name"] for p in by_name["RelNestedRoot B"]["rel_batch_nested_self_ref_destination"]},
+            {"RelNestedPeer B1"},
+        )
+        nested_a = by_name["RelNestedRoot A"]["rel_batch_nested_self_ref_destination"][0]
+        nested_b = by_name["RelNestedRoot B"]["rel_batch_nested_self_ref_destination"][0]
+        self.assertEqual({p["name"] for p in nested_a["rel_batch_nested_self_ref_destination"]}, {"RelNestedLeaf A2"})
+        self.assertEqual({p["name"] for p in nested_b["rel_batch_nested_self_ref_destination"]}, {"RelNestedLeaf B2"})
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_shared_fragment_across_root_aliases_does_not_cross_contaminate_cache(self):
+        """A relationship field reached via a shared fragment under two root aliases must not share cached data."""
+        schema = rebuild_graphql_schema()
+        query = """
+        query {
+            a: locations(name__ic: "RelBatchSmall") { ...RelFrag }
+            b: locations(name__ic: "RelBatchLarge") { ...RelFrag }
+        }
+        fragment RelFrag on LocationType {
+            name
+            rel_batch_location_to_vlans { name }
+        }
+        """
+        data, _ = self._run(schema, query, self.user)
+        self.assertEqual(len(data["a"]), self.SMALL)
+        self.assertEqual(len(data["b"]), self.LARGE)
+        for loc in data["b"]:
+            i = int(loc["name"].rsplit(" ", 1)[1])
+            expected = {f"RelBatchLarge VLAN {i}", f"RelBatchLarge VLAN {(i + 1) % self.LARGE}"}
+            self.assertEqual({v["name"] for v in loc["rel_batch_location_to_vlans"]}, expected)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_shared_fragment_at_different_depths_does_not_cross_contaminate_cache(self):
+        """A relationship field spread via a shared fragment at two depths must not share cached bulk data.
+
+        `locations { children: rel_x { ...F } ...F }`, with `F` containing `rel_x`, reuses the very same AST
+        field node for both: the top-level `...F` resolves `rel_x` as a direct child of the root `locations`
+        queryset, while the nested one (inside `children`) resolves `rel_x` of a peer reached through another
+        relationship field. Both share the same root field key, so unless the cache also accounts for
+        traversal depth, the nested use-site would reuse the top-level one's root-scoped bulk data and
+        silently drop its own peers.
+        """
+        location_type = LocationType.objects.get(name="Campus")
+        location_status = Status.objects.get_for_model(Location)[0]
+        self_ref = Relationship.objects.create(
+            label="Batch Depth Self Ref",
+            key="batch_depth_self_ref",
+            source_type=ContentType.objects.get_for_model(Location),
+            destination_type=ContentType.objects.get_for_model(Location),
+            type="many-to-many",
+        )
+        names = [
+            "RelDepthRoot A",
+            "RelDepthRoot B",
+            "RelDepthChild A1",
+            "RelDepthChild B1",
+            "RelDepthLeaf A2",
+            "RelDepthLeaf B2",
+        ]
+        root_a, root_b, child_a1, child_b1, leaf_a2, leaf_b2 = (
+            Location.objects.create(name=name, location_type=location_type, status=location_status) for name in names
+        )
+        RelationshipAssociation.objects.create(relationship=self_ref, source=root_a, destination=child_a1)
+        RelationshipAssociation.objects.create(relationship=self_ref, source=root_b, destination=child_b1)
+        RelationshipAssociation.objects.create(relationship=self_ref, source=child_a1, destination=leaf_a2)
+        RelationshipAssociation.objects.create(relationship=self_ref, source=child_b1, destination=leaf_b2)
+
+        schema = rebuild_graphql_schema()
+        query = """
+        query {
+            locations(name__ic: "RelDepthRoot") {
+                name
+                children: rel_batch_depth_self_ref_destination { ...F }
+                ...F
+            }
+        }
+        fragment F on LocationType {
+            name
+            rel_batch_depth_self_ref_destination { name }
+        }
+        """
+        data, _ = self._run(schema, query, self.user)
+        by_name = {loc["name"]: loc for loc in data["locations"]}
+
+        # Top-level `...F` (direct child of the root queryset): each root's own single child.
+        self.assertEqual(
+            {p["name"] for p in by_name["RelDepthRoot A"]["rel_batch_depth_self_ref_destination"]},
+            {"RelDepthChild A1"},
+        )
+        self.assertEqual(
+            {p["name"] for p in by_name["RelDepthRoot B"]["rel_batch_depth_self_ref_destination"]},
+            {"RelDepthChild B1"},
+        )
+        # Nested `...F` (inside `children`, i.e. a peer of a peer): each child's own leaf, not its root's child.
+        child_a = by_name["RelDepthRoot A"]["children"][0]
+        child_b = by_name["RelDepthRoot B"]["children"][0]
+        self.assertEqual({p["name"] for p in child_a["rel_batch_depth_self_ref_destination"]}, {"RelDepthLeaf A2"})
+        self.assertEqual({p["name"] for p in child_b["rel_batch_depth_self_ref_destination"]}, {"RelDepthLeaf B2"})
 
 
 class GraphQLExtendSchemaType(GraphQLTestCaseBase):

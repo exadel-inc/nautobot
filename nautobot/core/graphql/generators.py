@@ -3,6 +3,7 @@
 import logging
 
 from django.core.exceptions import ObjectDoesNotExist
+from django.db.models import Q
 import graphene
 import graphene_django_optimizer as gql_optimizer
 from graphql import GraphQLError
@@ -24,6 +25,45 @@ RESOLVER_PREFIX = "resolve_"
 
 
 LIST_SEARCH_PARAMS_BY_SCHEMA_TYPE = {}
+
+
+def _root_field_key(path):
+    """Walk a GraphQLResolveInfo path up to the root query field and return its response key.
+
+    Stable for every row/subfield resolved underneath one root field occurrence (e.g. all items of a
+    `locations(...)` list and their nested selections share the same root key), and distinct from any other
+    root field occurrence in the same operation, even one selecting the same type under a different alias.
+    """
+    while path.prev is not None:
+        path = path.prev
+    return path.key
+
+
+def _traversal_scope_key(path):
+    """Stable key for where in the query's shape a field occurs, ignoring list indices.
+
+    A fragment spread at two different depths/use-sites (e.g. shared under both a direct root child and a
+    nested peer reached through another relationship field) reuses the very same AST field node objects, so
+    identity of those nodes - or of the root field alone - cannot tell the use-sites apart. The full chain of
+    field/alias keys from root to this field can: it differs between use-sites, while staying identical across
+    list items/parent rows resolved at the same use-site, so the bulk cache below still batches across parents.
+    """
+    keys = []
+    while path is not None:
+        if not isinstance(path.key, int):
+            keys.append(path.key)
+        path = path.prev
+    return tuple(reversed(keys))
+
+
+def _is_direct_root_child_path(path):
+    """True when `path` is a field on an object fetched directly by the root list query.
+
+    False for a nested peer field reached through another relationship field (e.g. the inner
+    `rel_x` of `locations(...) { rel_x { rel_x { name } } }`), even though `_root_field_key` returns
+    the same key for both: that inner `rel_x` resolves peers of peers, not members of the root queryset.
+    """
+    return path.prev is not None and path.prev.prev is not None and path.prev.prev.prev is None
 
 
 def _graphql_selection_requests_field(info, field_name):
@@ -248,79 +288,139 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         peer_model (Model): Django Model of the peer of this relationship
     """
 
-    def resolve_relationship(self, info, **kwargs):
-        """Return a queryset or an object depending on the type of the relationship."""
-        peer_side = RelationshipSideChoices.OPPOSITE[side]
-        query_params = {"relationship": relationship}
+    peer_side = RelationshipSideChoices.OPPOSITE[side]
+
+    def optimized(queryset, info, tolerated_error):
+        """Apply graphene_django_optimizer, falling back to the plain queryset on the one known error."""
         # https://github.com/nautobot/nautobot/issues/1228
         # If querying for **only** the ID of the related object, for example:
         # { device(id:"...") { ... rel_my_relationship { id } } }
-        # we will get this exception:
+        # we will get this exception for the values_list() of association IDs:
         # TypeError: Cannot call select_related() after .values() or .values_list()
         # This appears to be a bug in graphene_django_optimizer but I haven't found a known issue on GitHub.
-        # For now we just work around it by catching the exception and retrying without optimization, below...
-        if not relationship.symmetric:
-            # Get the objects on the other side of this relationship
-            query_params[f"{side}_id"] = self.pk
+        # Similarly, we may see "AttributeError: object has no attribute 'only'" when optimizing a single object.
+        try:
+            return gql_optimizer.query(queryset, info)
+        except tolerated_error:
+            logger.debug(
+                "Caught %s in graphene_django_optimizer, falling back to un-optimized query", tolerated_error.__name__
+            )
+            return queryset
 
-            try:
-                queryset_ids = gql_optimizer.query(
-                    RelationshipAssociation.objects.filter(**query_params).values_list(f"{peer_side}_id", flat=True),
-                    info,
-                )
-            except TypeError:
-                logger.debug("Caught TypeError in graphene_django_optimizer, falling back to un-optimized query")
-                queryset_ids = RelationshipAssociation.objects.filter(**query_params).values_list(
-                    f"{peer_side}_id", flat=True
-                )
-        else:
-            # Get objects that are peers for this relationship, regardless of side
-            try:
-                queryset_ids = list(
-                    gql_optimizer.query(
-                        RelationshipAssociation.objects.filter(source_id=self.pk, **query_params).values_list(
-                            "destination_id", flat=True
-                        ),
-                        info,
-                    )
-                )
-                queryset_ids += list(
-                    gql_optimizer.query(
-                        RelationshipAssociation.objects.filter(destination_id=self.pk, **query_params).values_list(
-                            "source_id", flat=True
-                        ),
-                        info,
-                    )
-                )
-            except TypeError:
-                logger.debug("Caught TypeError in graphene_django_optimizer, falling back to un-optimized query")
-                queryset_ids = list(
-                    RelationshipAssociation.objects.filter(source_id=self.pk, **query_params).values_list(
-                        "destination_id", flat=True
-                    ),
-                )
-                queryset_ids += list(
-                    RelationshipAssociation.objects.filter(destination_id=self.pk, **query_params).values_list(
-                        "source_id", flat=True
-                    ),
-                )
-
-        # Object-permission enforcement on the remote model. This resolver already issues a fresh query per
-        # parent object, so `restrict()` only adds a WHERE clause here and does not introduce extra queries.
-        peer_queryset = peer_model.objects.filter(id__in=queryset_ids)
+    def restricted_peers(peer_ids, info):
+        """Peer objects with the given IDs that the requesting user is permitted to view."""
+        peer_queryset = peer_model.objects.filter(id__in=peer_ids)
         if hasattr(peer_queryset, "restrict"):
             peer_queryset = peer_queryset.restrict(info.context.user, "view")
+        return peer_queryset
 
+    def associated_peer_ids(parent_pk, info):
+        """IDs of the peers of a single parent object.
+
+        Non-symmetric relationships return a lazy queryset (used as a subquery, so no query of its own);
+        symmetric ones need two queries, one per direction.
+        """
+        associations = RelationshipAssociation.objects.filter(relationship=relationship)
+        if not relationship.symmetric:
+            return optimized(
+                associations.filter(**{f"{side}_id": parent_pk}).values_list(f"{peer_side}_id", flat=True),
+                info,
+                TypeError,
+            )
+        peer_ids = list(
+            optimized(
+                associations.filter(source_id=parent_pk).values_list("destination_id", flat=True), info, TypeError
+            )
+        )
+        peer_ids += list(
+            optimized(
+                associations.filter(destination_id=parent_pk).values_list("source_id", flat=True), info, TypeError
+            )
+        )
+        return peer_ids
+
+    def requested_parent_pks(parent_model, info):
+        """PKs of the root queryset `self` was drawn from, if resolution reached here through one.
+
+        Lets the bulk query below scope to just the parents this request actually asked for, instead of every
+        row of the relationship. `None` when there isn't one to trust (e.g. these parents are themselves peers
+        reached via another relationship field, rather than a direct root `locations(...)`-style query) - the
+        caller then falls back to loading the whole relationship, as before. The queryset was already fully
+        fetched by the time any of its rows' fields are being resolved, so reading its pks here costs no query.
+        """
+        if not _is_direct_root_child_path(info.path):
+            return None
+        root_querysets = getattr(info.context, "_gql_root_querysets", None)
+        entry = root_querysets.get((info.operation, _root_field_key(info.path))) if root_querysets else None
+        if entry is None or entry[0] is not parent_model:
+            return None
+        return [obj.pk for obj in entry[1]]
+
+    def bulk_peers_by_parent(parent_model, info, cache, cache_key):
+        """Return `({parent_pk: [peer_pk, ...]}, {peer_pk: (position, peer_obj)})`, loading it on first use.
+
+        Associations are loaded in one query, scoped to the requested parents when known (see
+        `requested_parent_pks`), and all permitted peers in another; this is cheaper than 1+ queries per parent.
+        """
+        if cache[cache_key] is None:
+            peer_ids_by_parent = {}
+            associations = RelationshipAssociation.objects.filter(relationship=relationship)
+            parent_pks = requested_parent_pks(parent_model, info)
+            if parent_pks is not None:
+                if relationship.symmetric:
+                    associations = associations.filter(Q(source_id__in=parent_pks) | Q(destination_id__in=parent_pks))
+                else:
+                    associations = associations.filter(**{f"{side}_id__in": parent_pks})
+            for source_id, destination_id in associations.values_list("source_id", "destination_id"):
+                if relationship.symmetric:
+                    pairs = [(source_id, destination_id), (destination_id, source_id)]
+                elif side == "source":
+                    pairs = [(source_id, destination_id)]
+                else:
+                    pairs = [(destination_id, source_id)]
+                for parent_id, peer_id in pairs:
+                    peer_ids_by_parent.setdefault(parent_id, {})[peer_id] = None
+            all_peer_ids = {peer_id for peers in peer_ids_by_parent.values() for peer_id in peers}
+            # Permission enforcement: peers the user may not view are absent here, so are never returned.
+            peers = {
+                peer.pk: (position, peer)
+                for position, peer in enumerate(gql_optimizer.query(restricted_peers(all_peer_ids, info), info))
+            }
+            cache[cache_key] = ({parent_id: list(peers_) for parent_id, peers_ in peer_ids_by_parent.items()}, peers)
+        return cache[cache_key]
+
+    def resolve_relationship(self, info, **kwargs):
+        """Return a list or an object depending on the type of the relationship."""
+        # Per-request, per-execution cache, never shared between requests/users. graphene-django resolves each
+        # parent object independently, so the first resolution of a given field (e.g. `device(id: ...)`) queries
+        # for just that parent; any further resolution (a list of parents) switches to loading everything at once.
+        # The cache holds a reference to the operation it belongs to: the `id()` of its AST nodes can't be reused
+        # while it is alive, and a different execution using the same request starts with an empty cache.
+        cached_operation, cache = getattr(info.context, "_gql_relationship_cache", (None, None))
+        if cached_operation is not info.operation:
+            cache = {}
+            info.context._gql_relationship_cache = (info.operation, cache)
+        # A shared fragment reuses the same field nodes at every depth/alias it is spread under, so the cache
+        # key is keyed on the full traversal scope rather than the root alias or node identity alone -
+        # otherwise a second use-site would reuse the first one's root-scoped bulk data (see
+        # `requested_parent_pks`) and silently drop its own peers.
+        cache_key = (relationship.pk, side, _traversal_scope_key(info.path))
+
+        if cache_key not in cache:
+            cache[cache_key] = None  # seen once; the bulk data is only loaded if there's a second parent
+            peer_queryset = restricted_peers(associated_peer_ids(self.pk, info), info)
+            if relationship.has_many(peer_side):
+                return gql_optimizer.query(peer_queryset, info)
+            return optimized(peer_queryset.first(), info, AttributeError)
+
+        peer_ids_by_parent, peers = bulk_peers_by_parent(type(self), info, cache, cache_key)
+        permitted = sorted(
+            (peers[peer_id] for peer_id in peer_ids_by_parent.get(self.pk, ()) if peer_id in peers),
+            key=lambda position_and_peer: position_and_peer[0],
+        )
         if relationship.has_many(peer_side):
-            return gql_optimizer.query(peer_queryset, info)
-
-        # Also apparently a graphene_django_optimizer bug - in the same query case as described above, here we may see:
-        # AttributeError: object has no attribute "only"
-        try:
-            return gql_optimizer.query(peer_queryset.first(), info)
-        except AttributeError:
-            logger.debug("Caught AttributeError in graphene_django_optimizer, falling back to un-optimized query")
-            return peer_queryset.first()
+            return [peer for _, peer in permitted]
+        return permitted[0][1] if permitted else None
 
     resolve_relationship.__name__ = resolver_name
     return mark_permission_enforced(resolve_relationship)
@@ -472,7 +572,15 @@ def generate_list_resolver(schema_type, resolver_name):
         if limit:
             qs = qs[:limit]
 
-        return gql_optimizer.query(qs, info)
+        qs = gql_optimizer.query(qs, info)
+        # Lets relationship resolvers scope their bulk association lookups to the parents this query actually
+        # returns, rather than every object with that relationship, by keying on this root field's occurrence
+        # in the document (see _root_field_key) rather than just `model`: a nested relationship field reached
+        # through a *different* root query/type must not mistake this list for its own parents.
+        if not hasattr(info.context, "_gql_root_querysets"):
+            info.context._gql_root_querysets = {}
+        info.context._gql_root_querysets[(info.operation, _root_field_key(info.path))] = (model, qs)
+        return qs
 
     list_resolver.__name__ = resolver_name
     return list_resolver
