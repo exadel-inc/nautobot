@@ -2270,8 +2270,11 @@ class ComponentCreateViewMixin(ObjectEditViewMixin):
 
     def get_component_model_form(self, request, data=None):
         """Return the per-instance component model form used to validate/save each expanded child."""
+        if data:
+            # Bound to the validated create-form data; GET-derived initial would make
+            # ModularComponentEditForm disable (and so discard) the submitted `module`.
+            return self.form_class(data)  # pylint: disable=not-callable
         return self.form_class(  # pylint: disable=not-callable
-            data or None,
             initial=normalize_querydict(request.GET, form_class=self.form_class),
         )
 
