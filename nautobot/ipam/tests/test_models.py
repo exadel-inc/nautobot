@@ -38,6 +38,7 @@ from nautobot.ipam.models import (
     VRF,
     VRFDeviceAssignment,
 )
+from nautobot.ipam.validators import DNSValidator
 from nautobot.virtualization.models import Cluster, ClusterType, VirtualMachine, VMInterface
 
 
@@ -2495,6 +2496,59 @@ class TestIPAddress(ModelTestCases.BaseModelTestCase):
         ip = IPAddress(address="10.0.0.75/24", status=self.status, namespace=self.namespace)
         ip.validated_save()
         self.assertTrue(IPAddress.objects.filter(host="10.0.0.75").exists())
+
+    def test_dns_name_validation(self):
+        """DNS names must follow DNS label structure; underscores are rejected and a single trailing dot is allowed."""
+        label_63 = "a" * 63
+        name_253 = ".".join(["a" * 61] * 4 + ["a" * 5])  # 4 * 62 + 5 = 253
+        self.assertEqual(len(name_253), 253)
+        valid = [
+            "host",
+            "host-1.example.com",
+            "host.example.com.",
+            label_63,
+            name_253,
+            name_253 + ".",
+        ]
+        invalid = [
+            "whatever-.your.tld",
+            "-host",
+            "host-",
+            "a.-b",
+            "a..b",
+            ".host",
+            "host..",
+            ".",
+            "a" * 64,
+            name_253 + "a",
+            "host name",
+            "host!",
+            "host\n",
+            "host.example.com.\n",
+            "example_1",
+            "_srv.example.com",
+            "a_.b",
+            "host_name.example",
+        ]
+        for name in valid:
+            with self.subTest(valid=name):
+                ip = IPAddress(address="192.0.2.10/24", status=self.status, namespace=self.namespace, dns_name=name)
+                ip.full_clean()
+        for name in invalid:
+            with self.subTest(invalid=name):
+                ip = IPAddress(address="192.0.2.10/24", status=self.status, namespace=self.namespace, dns_name=name)
+                with self.assertRaises(ValidationError) as cm:
+                    ip.full_clean()
+                self.assertIn("dns_name", cm.exception.message_dict)
+        for name in valid:
+            with self.subTest(validator_valid=name):
+                DNSValidator(name)
+        for name in invalid:
+            with self.subTest(validator_invalid=name):
+                with self.assertRaises(ValidationError) as cm:
+                    DNSValidator(name)
+                self.assertEqual(cm.exception.code, "invalid")
+                self.assertIn("DNS names must consist of", cm.exception.message)
 
 
 class TestIPAddressRange(ModelTestCases.BaseModelTestCase):
