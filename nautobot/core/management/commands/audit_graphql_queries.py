@@ -1,4 +1,6 @@
 from django.core.management.base import BaseCommand
+from graphene_django.settings import graphene_settings
+from graphql import GraphQLError, parse, validate
 
 from nautobot.core.graphql import execute_query
 from nautobot.users.models import User
@@ -17,10 +19,14 @@ class Command(BaseCommand):
         is_valid = True
         error_dict = {}
         for graph_ql_query in graph_ql_querys:
-            result = execute_query(graph_ql_query.query, user=user).to_dict()
-            if result.get("errors"):
-                errors = result.get("errors")
-                error_dict[graph_ql_query.name] = errors
+            try:
+                errors = validate(graphene_settings.SCHEMA.graphql_schema, parse(graph_ql_query.query))
+                if not errors:
+                    errors = execute_query(graph_ql_query.query, user=user).errors or []
+            except GraphQLError as error:
+                errors = [error]
+            if errors:
+                error_dict[graph_ql_query.name] = [error.message for error in errors]
                 is_valid = False
         if is_valid:
             self.stdout.write("\n>>> All GraphQLQuery query data are validated successfully!")
