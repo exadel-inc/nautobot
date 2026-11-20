@@ -2,7 +2,10 @@
 
 import logging
 
+from django.contrib.contenttypes.prefetch import GenericPrefetch
 from django.core.exceptions import ObjectDoesNotExist
+from django.db.models import F, Prefetch, Window
+from django.db.models.functions import RowNumber
 import graphene
 import graphene_django_optimizer as gql_optimizer
 from graphql import GraphQLError
@@ -237,6 +240,31 @@ def generate_computed_field_resolver(name, resolver_name):
     return resolve_computed_field
 
 
+def expand_model_ordering(model, prefix=""):
+    """Return the default ordering of a model as expressions, following related models' ordering like Django does.
+
+    Returns None when the ordering has anything other than plain field names and plain foreign keys, such as
+    expressions, `__` paths or `<fk>_id` names, because those are not resolved here the way Django resolves them.
+    """
+    expressions = []
+    for name in model._meta.ordering or ["pk"]:
+        if not isinstance(name, str) or "__" in name:
+            return None
+        descending = name.startswith("-")
+        field_name = name.lstrip("-")
+        field = None if field_name == "pk" else model._meta.get_field(field_name)
+        if field is not None and field.is_relation and field.attname == field_name:
+            return None
+        if field is not None and field.is_relation and field.related_model._meta.ordering:
+            related = expand_model_ordering(field.related_model, f"{prefix}{field_name}__")
+            if related is None:
+                return None
+            expressions += [expression.reverse_ordering() if descending else expression for expression in related]
+        else:
+            expressions.append(F(f"{prefix}{field_name}").desc() if descending else F(f"{prefix}{field_name}").asc())
+    return expressions
+
+
 def generate_relationship_resolver(name, resolver_name, relationship, side, peer_model):
     """Generate function to resolve each custom relationship within each DjangoObjectType.
 
@@ -248,9 +276,42 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         peer_model (Model): Django Model of the peer of this relationship
     """
 
+    peer_side = RelationshipSideChoices.OPPOSITE[side]
+    association_field = f"{side}_for_associations"
+
+    def prefetched_attr(info):
+        response_key = (info.field_nodes[0].alias or info.field_nodes[0].name).value
+        return f"_prefetched_{resolver_name}_{response_key}"
+
+    def prefetch_associations_and_peers(info, *args):
+        """Prefetch the associations of all parents loaded at this level, with their permitted peers.
+
+        Symmetric relationships are not prefetched: their peers come from two queries whose order can't be merged.
+        Neither are peers whose model ordering can't be expanded by `expand_model_ordering`.
+        """
+        peer_ordering = expand_model_ordering(peer_model)
+        if relationship.symmetric or peer_ordering is None:
+            return []
+        peer_queryset = peer_model.objects.all()
+        if hasattr(peer_queryset, "restrict"):
+            peer_queryset = peer_queryset.restrict(info.context.user, "view")
+        peer_queryset = peer_queryset.annotate(peer_rank=Window(RowNumber(), order_by=peer_ordering))
+        associations = RelationshipAssociation.objects.filter(relationship=relationship).prefetch_related(
+            GenericPrefetch(peer_side, [gql_optimizer.query(peer_queryset, info)])
+        )
+        return [Prefetch(association_field, queryset=associations, to_attr=prefetched_attr(info))]
+
+    @gql_optimizer.resolver_hints(prefetch_related=prefetch_associations_and_peers)
     def resolve_relationship(self, info, **kwargs):
         """Return a queryset or an object depending on the type of the relationship."""
-        peer_side = RelationshipSideChoices.OPPOSITE[side]
+        prefetched_associations = getattr(self, prefetched_attr(info), None)
+        if prefetched_associations is not None:
+            peers = [getattr(association, peer_side) for association in prefetched_associations]
+            peers = sorted((peer for peer in peers if peer is not None), key=lambda peer: peer.peer_rank)
+            if relationship.has_many(peer_side):
+                return peers
+            return peers[0] if peers else None
+
         query_params = {"relationship": relationship}
         # https://github.com/nautobot/nautobot/issues/1228
         # If querying for **only** the ID of the related object, for example:
