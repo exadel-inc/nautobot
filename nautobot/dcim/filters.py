@@ -1344,11 +1344,6 @@ class InventoryItemFilterSet(DeviceComponentModelFilterSetMixin, RelationshipMod
             "description": "icontains",
         },
     )
-    location = NaturalKeyOrPKMultipleChoiceFilter(
-        queryset=Location.objects.all(),
-        field_name="device__location",
-        to_field_name="name",
-    )
     # TODO: solve https://github.com/nautobot/nautobot/issues/2875 to use this filter correctly
     device = NaturalKeyOrPKMultipleChoiceFilter(
         prefers_id=True,
@@ -1427,8 +1422,7 @@ class VirtualChassisFilterSet(NautobotFilterSet):
         queryset=Device.objects.all(),
         to_field_name="name",
     )
-    # TODO Check this filter as it is not using TreeNode...
-    location = NaturalKeyOrPKMultipleChoiceFilter(
+    location = TreeNodeMultipleChoiceFilter(
         prefers_id=True,
         field_name="master__location",
         queryset=Location.objects.all(),
@@ -1790,11 +1784,6 @@ class CableFilterSet(NautobotFilterSet, StatusModelFilterSetMixin):
 
 
 class ConnectionFilterSetMixin:
-    def filter_location(self, queryset, name, value):
-        if not value.strip():
-            return queryset
-        return queryset.filter(device__location__name=value)
-
     def filter_device(self, queryset, name, value):
         if not value:
             return queryset
@@ -1808,9 +1797,11 @@ class ConsoleConnectionFilterSet(ConnectionFilterSetMixin, BaseFilterSet):
             "device__name": "icontains",
         },
     )
-    location = django_filters.CharFilter(
-        method="filter_location",
-        label="Location (name)",
+    location = TreeNodeMultipleChoiceFilter(
+        field_name="device__location",
+        queryset=Location.objects.all(),
+        to_field_name="name",
+        label="Location (name or ID)",
     )
     device_id = MultiValueUUIDFilter(method="filter_device", label="Device (ID)")
     device = MultiValueCharFilter(method="filter_device", field_name="device__name", label="Device (name)")
@@ -1827,9 +1818,11 @@ class PowerConnectionFilterSet(ConnectionFilterSetMixin, BaseFilterSet):
             "device__name": "icontains",
         },
     )
-    location = django_filters.CharFilter(
-        method="filter_location",
-        label="Location (name)",
+    location = TreeNodeMultipleChoiceFilter(
+        field_name="device__location",
+        queryset=Location.objects.all(),
+        to_field_name="name",
+        label="Location (name or ID)",
     )
     device_id = MultiValueUUIDFilter(method="filter_device", label="Device (ID)")
     device = MultiValueCharFilter(method="filter_device", field_name="device__name", label="Device (name)")
@@ -1849,7 +1842,12 @@ class InterfaceConnectionFilterSet(BaseFilterSet):
     """
 
     q = django_filters.CharFilter(method="search", label="Search")
-    location = django_filters.CharFilter(method="filter_location", label="Location (name)")
+    location = NaturalKeyOrPKMultipleChoiceFilter(
+        method="filter_location",
+        queryset=Location.objects.all(),
+        to_field_name="name",
+        label="Location (name or ID)",
+    )
     device_id = MultiValueUUIDFilter(method="filter_device_id", label="Device (ID)")
     device = MultiValueCharFilter(method="filter_device_name", label="Device (name)")
 
@@ -1870,9 +1868,12 @@ class InterfaceConnectionFilterSet(BaseFilterSet):
         return self._filter_either_endpoint(queryset, Q(name__icontains=value) | Q(device__name__icontains=value))
 
     def filter_location(self, queryset, name, value):
-        if not value.strip():
+        if not value:
             return queryset
-        return self._filter_either_endpoint(queryset, Q(device__location__name=value))
+        location_pks = set()
+        for location in value:
+            location_pks.update(location.cacheable_descendants_pks(include_self=True))
+        return self._filter_either_endpoint(queryset, Q(device__location__in=location_pks))
 
     def filter_device_id(self, queryset, name, value):
         return self._filter_either_endpoint(queryset, Q(device_id__in=value))
