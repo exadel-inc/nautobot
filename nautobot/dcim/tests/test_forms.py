@@ -554,6 +554,16 @@ class InterfaceTestCase(NautobotTestCaseMixin, TestCase):
             serial="interface-form-bay",
         )
 
+    def test_interface_form_with_initial_module_disables_device_and_module(self):
+        form = InterfaceForm(initial={"module": self.bay_module.pk})
+        self.assertTrue(form.fields["device"].disabled)
+        self.assertTrue(form.fields["module"].disabled)
+
+    def test_interface_form_with_initial_device_disables_only_device(self):
+        form = InterfaceForm(initial={"device": self.device.pk})
+        self.assertTrue(form.fields["device"].disabled)
+        self.assertFalse(form.fields["module"].disabled)
+
     def test_interface_form_clean_vlan_location_success(self):
         """Assert that form validation succeeds when matching locations/parent locations are associated to tagged VLAN"""
         location = self.device.location

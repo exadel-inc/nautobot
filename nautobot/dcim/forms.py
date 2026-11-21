@@ -2909,8 +2909,9 @@ class ModularComponentEditForm(ComponentEditForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Disable the device and module fields if an initial value is provided for either
-        if "device" in self.initial or "module" in self.initial:
+        # Disable the device and module fields if an initial module is provided
+        # (ComponentEditForm already disables the device field if an initial device is provided)
+        if "module" in self.initial:
             self.fields["device"].disabled = True
             self.fields["module"].disabled = True
 
