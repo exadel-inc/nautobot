@@ -2,18 +2,23 @@
 
 {% block extra_styles %}
     <style>
-        .card {
+        .card:has(.nb-job-tiles) {
             border: none;
             box-shadow: none;
         }
 
-        .table-responsive {
+        .table-responsive:has(.nb-job-tiles) {
             overflow: visible;
+        }
+
+        /* Leave room for the loading spinner while the (still empty) tiles are being fetched. */
+        .htmx-indicator.htmx-request ~ .nb-job-tiles {
+            min-height: 6rem;
         }
     </style>
 {% endblock %}
 
-<div class="nb-tiles">
+<div class="nb-tiles nb-job-tiles">
     {% for row in table.page.object_list|default:table.rows %}
         <article class="nb-tile{% if not perms.extras.run_job or not row.record.runnable %} nb-disabled{% endif %}">
             <header class="nb-tile-header">
