@@ -488,6 +488,41 @@ class GraphQLRelatedObjectPermissionTest(GraphQLTestCaseBase):
         vlan_names = sorted(vlan["name"] for vlan in result.data["locations"][0][self.rel_field_name])
         self.assertEqual(vlan_names, ["Visible VLAN"])
 
+    def test_relationship_traversal_to_one_enforces_remote_model_permissions(self):
+        """A to-one Relationship field is null when the user may not view the peer."""
+        visible_tenant = Tenant.objects.create(name="Visible Tenant")
+        hidden_tenant = Tenant.objects.create(name="Hidden Tenant")
+        relationship = Relationship.objects.create(
+            label="Perm Tenant to VLANs",
+            key="perm_tenant_to_vlans",
+            source_type=ContentType.objects.get_for_model(Tenant),
+            destination_type=ContentType.objects.get_for_model(VLAN),
+            type="one-to-many",
+        )
+        RelationshipAssociation.objects.create(
+            relationship=relationship, source=visible_tenant, destination=self.visible_vlan
+        )
+        RelationshipAssociation.objects.create(
+            relationship=relationship, source=hidden_tenant, destination=self.hidden_vlan
+        )
+        self._grant_view(self.user, VLAN)
+        self._grant_view(self.user, Tenant, {"name": "Visible Tenant"})
+
+        query = """
+        query {
+            vlans(name: ["Visible VLAN", "Hidden VLAN"]) {
+                name
+                rel_perm_tenant_to_vlans {
+                    name
+                }
+            }
+        }
+        """
+        result = execute_query_on_rebuilt_schema(query, user=self.user)
+        self.assertIsNone(result.errors)
+        tenants_by_vlan = {vlan["name"]: vlan["rel_perm_tenant_to_vlans"] for vlan in result.data["vlans"]}
+        self.assertEqual(tenants_by_vlan, {"Visible VLAN": {"name": "Visible Tenant"}, "Hidden VLAN": None})
+
     def test_fk_traversal_enforces_related_model_permissions(self):
         """Forward FK traversal must respect view permissions on the related model."""
         # The user may view the rack, but is granted NO permission to view its location.
@@ -1673,7 +1708,7 @@ class GraphQLQueryTest(GraphQLTestCaseBase):
 
         vlan_status = Status.objects.get_for_model(VLAN)[0]
         cls.relationship_list_vlans = [
-            VLAN.objects.create(name=f"Rel VLAN {i}", vid=3500 + i, status=vlan_status) for i in range(3)
+            VLAN.objects.create(name=f"Rel VLAN {i}", vid=3502 - i, status=vlan_status) for i in range(3)
         ]
         cls.relationship_device_vlans = Relationship.objects.create(
             label="Rel Devices to VLANs",
@@ -3121,6 +3156,7 @@ query {
 
     @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
     def test_query_relationship_list_query_count_independent_of_object_count(self):
+        """The query count of a list with relationship fields is the same for 3 and 6 devices."""
         query = "query { devices { name rel_rel_devices_to_vlans { name } rel_rel_tenant_to_devices { name } } }"
         self._create_relationship_list_devices(3)
         schema = rebuild_graphql_schema()
@@ -3149,6 +3185,42 @@ query {
             self.assertEqual(by_name[device.name]["rel_rel_tenant_to_devices"], {"id": str(self.tenant1.id)})
         self.assertIsNone(by_name[self.device2.name]["rel_rel_tenant_to_devices"])
         self.assertEqual(by_name[self.device2.name]["rel_rel_devices_to_vlans"], [])
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_relationship_list_results_non_symmetric_self_relationship(self):
+        """Both sides of a non-symmetric self-relationship return their own peers in one list query."""
+        relationship = Relationship.objects.create(
+            label="Rel Device Parent",
+            key="rel_device_parent",
+            source_type=ContentType.objects.get_for_model(Device),
+            destination_type=ContentType.objects.get_for_model(Device),
+            type="many-to-many",
+        )
+        for source, destination in ((self.device1, self.device2), (self.device1, self.device3)):
+            RelationshipAssociation.objects.create(relationship=relationship, source=source, destination=destination)
+        query = """
+        query {
+            devices(name: ["Device 1", "Device 2", "Device 3"]) {
+                name
+                rel_rel_device_parent_source { name }
+                rel_rel_device_parent_destination { name }
+            }
+        }
+        """
+        result = execute_query_on_rebuilt_schema(query, request=self.request)
+        self.assertIsNone(result.errors)
+        by_name = {item["name"]: item for item in result.data["devices"]}
+        self.assertEqual(
+            {name: sorted(d["name"] for d in item["rel_rel_device_parent_source"]) for name, item in by_name.items()},
+            {"Device 1": [], "Device 2": ["Device 1"], "Device 3": ["Device 1"]},
+        )
+        self.assertEqual(
+            {
+                name: sorted(d["name"] for d in item["rel_rel_device_parent_destination"])
+                for name, item in by_name.items()
+            },
+            {"Device 1": ["Device 2", "Device 3"], "Device 2": [], "Device 3": []},
+        )
 
 
 class GraphQLTypeTestCase(UnitTestTestCase):

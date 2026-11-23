@@ -262,6 +262,7 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         ordering = [
             f"-{peer_path}__{field[1:]}" if field.startswith("-") else f"{peer_path}__{field}"
             for field in peer_model._meta.ordering
+            if isinstance(field, str) and field != "?"
         ]
         return Prefetch(
             f"{side}_for_associations",
