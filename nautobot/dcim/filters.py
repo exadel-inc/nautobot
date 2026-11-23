@@ -1344,7 +1344,7 @@ class InventoryItemFilterSet(DeviceComponentModelFilterSetMixin, RelationshipMod
             "description": "icontains",
         },
     )
-    location = NaturalKeyOrPKMultipleChoiceFilter(
+    location = TreeNodeMultipleChoiceFilter(
         queryset=Location.objects.all(),
         field_name="device__location",
         to_field_name="name",
@@ -1427,8 +1427,7 @@ class VirtualChassisFilterSet(NautobotFilterSet):
         queryset=Device.objects.all(),
         to_field_name="name",
     )
-    # TODO Check this filter as it is not using TreeNode...
-    location = NaturalKeyOrPKMultipleChoiceFilter(
+    location = TreeNodeMultipleChoiceFilter(
         prefers_id=True,
         field_name="master__location",
         queryset=Location.objects.all(),

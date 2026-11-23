@@ -3270,6 +3270,17 @@ class InventoryItemTestCase(DeviceComponentTestMixin, FilterTestCases.FilterTest
             params = {"discovered": False}
             self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
 
+    def test_location(self):
+        child_location = self.loc2
+        parent_location = child_location.parent
+        Device.objects.filter(name="Device 1").update(location=child_location)
+        expected = self.queryset.filter(device__location__in=parent_location.descendants(include_self=True))
+        self.assertTrue(expected.filter(device__location=child_location).exists())
+        for value in (parent_location.name, str(parent_location.pk)):
+            with self.subTest(value=value):
+                params = {"location": [value]}
+                self.assertQuerySetEqualAndNotEmpty(self.filterset(params, self.queryset).qs, expected)
+
     def test_serial(self):
         # TODO: Not a generic_filter_test because this is a single-value filter
         # 2.0 TODO: Support filtering for multiple values
@@ -3363,6 +3374,18 @@ class VirtualChassisTestCase(FilterTestCases.FilterTestCase):
         Device.objects.filter(pk=devices[1].pk).update(virtual_chassis=virtual_chassis[0])
         Device.objects.filter(pk=devices[3].pk).update(virtual_chassis=virtual_chassis[1])
         Device.objects.filter(pk=devices[5].pk).update(virtual_chassis=virtual_chassis[2])
+
+    def test_location(self):
+        parent_location = self.locations[0]
+        child_location = self.locations[1]
+        child_location.parent = parent_location
+        child_location.validated_save()
+        expected = self.queryset.filter(master__location__in=parent_location.descendants(include_self=True))
+        self.assertTrue(expected.filter(master__location=child_location).exists())
+        for value in (parent_location.name, str(parent_location.pk)):
+            with self.subTest(value=value):
+                params = {"location": [value]}
+                self.assertQuerySetEqualAndNotEmpty(self.filterset(params, self.queryset).qs, expected)
 
 
 class CableTypeTestCase(FilterTestCases.FilterTestCase):
