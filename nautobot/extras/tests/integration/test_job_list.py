@@ -1,6 +1,6 @@
 from selenium.webdriver.common.keys import Keys
 
-from nautobot.core.testing.integration import CollapseAllButtonTestCase
+from nautobot.core.testing.integration import CollapseAllButtonTestCase, SeleniumTestCase
 
 
 class JobListCollapseAndExpandButton(CollapseAllButtonTestCase):
@@ -207,3 +207,40 @@ class JobListCollapseAndExpandButton(CollapseAllButtonTestCase):
         self.assertGreater(self._get_expanded_row_count(), 0)
         self.assertGreater(self._get_collapsed_row_count(), 0)
         self.assertEqual(self._get_collapse_all_button_text(), "Expand All Groups")
+
+
+class JobListTilesLoadingIndicatorTestCase(SeleniumTestCase):
+    """Integration tests for the loading indicator of the Jobs List page in Tiles mode."""
+
+    def setUp(self):
+        super().setUp()
+        self.login_as_superuser()
+
+    def test_tiles_loading_spinner_is_inside_card_and_centered(self):
+        """While the Tiles table is loading, the spinner is fully visible and centred in the card."""
+        self.browser.visit(f"{self.live_server_url}/extras/jobs/?display=tiles")
+        self.assertTrue(self.browser.is_element_present_by_css(".nb-job-tiles .nb-tile", wait_time=10))
+
+        # Force the loading state with an empty tiles grid, as in the first render, instead of racing the request.
+        geometry = self.browser.execute_script(
+            """
+            const indicator = document.querySelector("#object_table-htmx-indicator");
+            const card = indicator.closest(".card");
+            document.querySelector(".nb-job-tiles").replaceChildren();
+            indicator.classList.add("htmx-request");
+            const rect = (el) => el.getBoundingClientRect().toJSON();
+            return {
+                card: rect(card),
+                overlay: rect(indicator.firstElementChild),
+                spinner: rect(indicator.querySelector(".spinner-border")),
+            };
+            """
+        )
+        card, overlay, spinner = geometry["card"], geometry["overlay"], geometry["spinner"]
+        self.assertAlmostEqual(overlay["left"], card["left"], delta=1)
+        self.assertGreaterEqual(spinner["top"], card["top"])
+        self.assertLessEqual(spinner["bottom"], card["bottom"])
+        self.assertGreaterEqual(spinner["left"], card["left"])
+        self.assertLessEqual(spinner["right"], card["right"])
+        self.assertAlmostEqual(spinner["left"] + spinner["width"] / 2, card["left"] + card["width"] / 2, delta=2)
+        self.assertAlmostEqual(spinner["top"] + spinner["height"] / 2, card["top"] + card["height"] / 2, delta=2)
