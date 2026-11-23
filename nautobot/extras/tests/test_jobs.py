@@ -2116,7 +2116,7 @@ class JobResultEnqueueJobCase(TransactionTestCase):
     @mock.patch("nautobot.extras.models.jobs.run_kubernetes_job_and_return_job_result")
     def test_kubernetes_queue_sets_task_name(self, mock_kubernetes_job):
         kubernetes_queue = JobQueue.objects.create(
-            name="Empty Job Queue 1",
+            name="Kubernetes Job Queue",
             queue_type=JobQueueTypeChoices.TYPE_KUBERNETES,
         )
 

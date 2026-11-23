@@ -3248,9 +3248,11 @@ class GitRepositoryTestCase(
         self.assertEqual(response.context["result"], {})
 
     @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
-    @mock.patch("nautobot.extras.models.jobs.run_kubernetes_job_and_return_job_result")
-    def test_view_sync_job_result_on_kubernetes_queue(self, mock_kubernetes_job):
-        mock_kubernetes_job.side_effect = lambda job_result, job_kwargs: job_result
+    @mock.patch(
+        "nautobot.extras.utils.get_kubernetes_job_manifest",
+        return_value={"spec": {"template": {"spec": {"containers": [{}]}}}},
+    )
+    def test_view_sync_job_result_on_kubernetes_queue(self, _):
         kubernetes_queue = JobQueue.objects.create(name="Kubernetes", queue_type=JobQueueTypeChoices.TYPE_KUBERNETES)
         job_model = Job.objects.get(job_class_name="GitRepositorySync")
         job_model.default_job_queue = kubernetes_queue
@@ -3261,8 +3263,6 @@ class GitRepositoryTestCase(
         instance = self._get_queryset().first()
 
         job_result = instance.sync(user=self.user)
-        job_result.task_kwargs = {"repository": str(instance.pk)}
-        job_result.save()
 
         self.assertEqual(instance.get_latest_sync(), job_result)
         response = self.client.get(reverse("extras:gitrepository_result", kwargs={"pk": instance.pk}))
