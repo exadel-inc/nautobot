@@ -1911,8 +1911,6 @@ class InterfaceConnectionFilterSet(BaseFilterSet):
         return self._filter_either_endpoint(queryset, Q(device__location__name=value))
 
     def filter_location_subtree(self, queryset, name, value):
-        if not value:
-            return queryset
         return self._filter_either_endpoint(queryset, self.filters["location_subtree"].generate_query(value))
 
     def filter_device_id(self, queryset, name, value):

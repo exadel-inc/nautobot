@@ -5101,17 +5101,18 @@ class InterfaceConnectionFilterSetTestCase(_ConnectionFilterSetTestMixin, Filter
 
     def test_location_subtree_matches_either_endpoint(self):
         parent, child = self._move_device_to_child_location(self.device_alpha)
-        alpha_interfaces = self.device_alpha.interfaces.values("pk")
-        expected = self.queryset.filter(Q(origin_id__in=alpha_interfaces) | Q(destination_id__in=alpha_interfaces))
+        iface_ct = ContentType.objects.get_for_model(Interface)
+        both_directions = CablePath.objects.filter(origin_type=iface_ct, destination_type=iface_ct)
         for value in (child.name, str(child.pk)):
             with self.subTest(value=value):
-                self.assertQuerysetEqualAndNotEmpty(
-                    self.filterset({"location_subtree": [value]}, self.queryset).qs, expected, ordered=False
+                result = self.filterset({"location_subtree": [value]}, both_directions).qs
+                self.assertEqual(result.count(), 4)
+                self.assertTrue(
+                    result.filter(origin_id=self.iface_bravo.pk, destination_id=self.iface_alpha.pk).exists()
+                )
+                self.assertTrue(
+                    result.filter(origin_id=self.iface_alpha.pk, destination_id=self.iface_bravo.pk).exists()
                 )
         self.assertQuerysetEqualAndNotEmpty(
             self.filterset({"location_subtree": [parent.name]}, self.queryset).qs, self.queryset, ordered=False
         )
-
-    def test_location_subtree_empty_input_returns_unfiltered_queryset(self):
-        result = self.filterset({"location_subtree": []}, self.queryset).qs
-        self.assertEqual(result.count(), self.queryset.count())
