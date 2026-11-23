@@ -1116,6 +1116,7 @@ class JobResult(SavedViewMixin, BaseModel, CustomFieldModel):
                 job_model=job_model,
                 scheduled_job=schedule,
                 user=user,
+                task_name=job_model.class_path,
             )
         else:
             if job_result.user != user:

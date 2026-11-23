@@ -2113,6 +2113,24 @@ class JobResultEnqueueJobCase(TransactionTestCase):
                 actual_job_result_arg = call_args[0][0]  # first positional arg
                 self.assertEqual(actual_job_result_arg.celery_kwargs.get("nautobot_job_console_log"), console_log)
 
+    @mock.patch("nautobot.extras.models.jobs.run_kubernetes_job_and_return_job_result")
+    def test_kubernetes_queue_sets_task_name(self, mock_kubernetes_job):
+        kubernetes_queue = JobQueue.objects.create(
+            name="Empty Job Queue 1",
+            queue_type=JobQueueTypeChoices.TYPE_KUBERNETES,
+        )
+
+        JobResult.enqueue_job(
+            job_model=self.job_model,
+            user=self.user,
+            job_queue=kubernetes_queue,
+            job_kwargs={"foo": "bar"},
+        )
+
+        job_result = mock_kubernetes_job.call_args[0][0]
+        job_result.refresh_from_db()
+        self.assertEqual(job_result.task_name, self.job_model.class_path)
+
 
 class RunConsoleLogJobTestCase(CelerySubprocessTestCase):
     """Test run_console_log_job_and_return_job_result E2E"""
