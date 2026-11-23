@@ -307,7 +307,6 @@ class GetCablePkTestCase(TestCase):
             name="1x2 Breakout Cable", a_connectors=1, b_connectors=2, total_lanes=2
         )
 
-        # Only the first lane's far connector is cabled; the second lane is left open.
         cls.breakout_cable = Cable(
             termination_a=cls.spine_interface,
             termination_b=leaf_interface,
@@ -336,3 +335,15 @@ class GetCablePkTestCase(TestCase):
     def test_get_cable_pk_uncabled_interface_returns_empty_string(self):
         self.assertIsNone(self.uncabled_interface.cable)
         self.assertEqual(get_cable_pk(self.uncabled_interface), "")
+
+    def test_get_cable_pk_virtual_subinterface_returns_empty_string(self):
+        subiface = Interface.objects.create(
+            device=self.spine_interface.device,
+            name="Spine Interface 1.100",
+            type=InterfaceTypeChoices.TYPE_VIRTUAL,
+            status=self.spine_interface.status,
+            parent_interface=self.spine_interface,
+        )
+
+        self.assertIsNone(subiface.breakout_position)
+        self.assertEqual(get_cable_pk(subiface), "")
