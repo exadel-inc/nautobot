@@ -14,7 +14,7 @@ from nautobot.core.testing import TestCase
 from nautobot.dcim.models import Cable, CableToCableTermination, Device, PowerPort
 from nautobot.extras.choices import JobQueueTypeChoices
 from nautobot.extras.exceptions import KubernetesJobManifestError
-from nautobot.extras.models import DynamicGroupMembership, JobQueue, JobResult, SavedView, TaggedItem
+from nautobot.extras.models import DynamicGroupMembership, Job, JobQueue, JobResult, SavedView, TaggedItem
 from nautobot.extras.models.models import UserSavedViewAssociation
 from nautobot.extras.registry import registry
 from nautobot.extras.utils import (
@@ -370,6 +370,19 @@ class UtilsTestCase(TestCase):
                 )
                 result = get_kubernetes_job_manifest(job_queue.name)
                 self.assertIsNone(result)
+
+    @mock.patch("nautobot.extras.utils.transaction.on_commit")
+    @mock.patch("nautobot.extras.utils.get_kubernetes_job_manifest")
+    def test_run_kubernetes_job_and_return_job_result_sets_task_name(self, mock_get_manifest, mock_on_commit):
+        """The job class path is stored as the task name, as the Celery result backend does for Celery queues."""
+        mock_get_manifest.return_value = {"spec": {"template": {"spec": {"containers": [{}]}}}}
+        job_model = Job.objects.get_for_class_path("nautobot.core.jobs.GitRepositorySync")
+        job_result = JobResult.objects.create(name=job_model.name, job_model=job_model, user=self.user)
+
+        run_kubernetes_job_and_return_job_result(job_result, {})
+
+        job_result.refresh_from_db()
+        self.assertEqual(job_result.task_name, job_model.class_path)
 
     @override_settings(
         JOB_QUEUE_PATH="/nonexistent/job-queues",

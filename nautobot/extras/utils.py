@@ -864,9 +864,11 @@ def run_kubernetes_job_and_return_job_result(job_result, job_kwargs):
     if not pod_manifest:
         raise KubernetesJobManifestError("Unable to retrieve a kubernetes job manifest.")
 
+    if job_result.job_model is not None:
+        job_result.task_name = job_result.job_model.class_path
     if not getattr(job_result.job_model, "has_sensitive_variables", False):
         job_result.task_kwargs = job_kwargs
-        job_result.save()
+    job_result.save()
 
     pod_name = settings.KUBERNETES_JOB_POD_NAME + "-" + str(job_result.pk)
     pod_manifest.setdefault("metadata", {})
