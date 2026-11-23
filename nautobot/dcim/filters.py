@@ -1349,6 +1349,13 @@ class InventoryItemFilterSet(DeviceComponentModelFilterSetMixin, RelationshipMod
         field_name="device__location",
         to_field_name="name",
     )
+    location_subtree = TreeNodeMultipleChoiceFilter(
+        prefers_id=True,
+        field_name="device__location",
+        queryset=Location.objects.all(),
+        to_field_name="name",
+        label="Location(s) and descendants thereof (name or ID)",
+    )
     # TODO: solve https://github.com/nautobot/nautobot/issues/2875 to use this filter correctly
     device = NaturalKeyOrPKMultipleChoiceFilter(
         prefers_id=True,
@@ -1434,6 +1441,13 @@ class VirtualChassisFilterSet(NautobotFilterSet):
         queryset=Location.objects.all(),
         to_field_name="name",
         label="Location (name or ID)",
+    )
+    location_subtree = TreeNodeMultipleChoiceFilter(
+        prefers_id=True,
+        field_name="master__location",
+        queryset=Location.objects.all(),
+        to_field_name="name",
+        label="Location(s) and descendants thereof (name or ID)",
     )
     tenant = NaturalKeyOrPKMultipleChoiceFilter(
         field_name="master__tenant",
@@ -1812,6 +1826,13 @@ class ConsoleConnectionFilterSet(ConnectionFilterSetMixin, BaseFilterSet):
         method="filter_location",
         label="Location (name)",
     )
+    location_subtree = TreeNodeMultipleChoiceFilter(
+        prefers_id=True,
+        field_name="device__location",
+        queryset=Location.objects.all(),
+        to_field_name="name",
+        label="Location(s) and descendants thereof (name or ID)",
+    )
     device_id = MultiValueUUIDFilter(method="filter_device", label="Device (ID)")
     device = MultiValueCharFilter(method="filter_device", field_name="device__name", label="Device (name)")
 
@@ -1830,6 +1851,13 @@ class PowerConnectionFilterSet(ConnectionFilterSetMixin, BaseFilterSet):
     location = django_filters.CharFilter(
         method="filter_location",
         label="Location (name)",
+    )
+    location_subtree = TreeNodeMultipleChoiceFilter(
+        prefers_id=True,
+        field_name="device__location",
+        queryset=Location.objects.all(),
+        to_field_name="name",
+        label="Location(s) and descendants thereof (name or ID)",
     )
     device_id = MultiValueUUIDFilter(method="filter_device", label="Device (ID)")
     device = MultiValueCharFilter(method="filter_device", field_name="device__name", label="Device (name)")
@@ -1850,6 +1878,14 @@ class InterfaceConnectionFilterSet(BaseFilterSet):
 
     q = django_filters.CharFilter(method="search", label="Search")
     location = django_filters.CharFilter(method="filter_location", label="Location (name)")
+    location_subtree = TreeNodeMultipleChoiceFilter(
+        prefers_id=True,
+        field_name="device__location",
+        queryset=Location.objects.all(),
+        to_field_name="name",
+        method="filter_location_subtree",
+        label="Location(s) and descendants thereof (name or ID)",
+    )
     device_id = MultiValueUUIDFilter(method="filter_device_id", label="Device (ID)")
     device = MultiValueCharFilter(method="filter_device_name", label="Device (name)")
 
@@ -1873,6 +1909,11 @@ class InterfaceConnectionFilterSet(BaseFilterSet):
         if not value.strip():
             return queryset
         return self._filter_either_endpoint(queryset, Q(device__location__name=value))
+
+    def filter_location_subtree(self, queryset, name, value):
+        if not value:
+            return queryset
+        return self._filter_either_endpoint(queryset, self.filters["location_subtree"].generate_query(value))
 
     def filter_device_id(self, queryset, name, value):
         return self._filter_either_endpoint(queryset, Q(device_id__in=value))

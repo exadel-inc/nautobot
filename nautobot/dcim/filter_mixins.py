@@ -117,6 +117,13 @@ class DeviceComponentModelFilterSetMixin(CustomFieldModelFilterSetMixin):
         to_field_name="name",
         label="Location (name or ID)",
     )
+    location_subtree = TreeNodeMultipleChoiceFilter(
+        prefers_id=True,
+        field_name="device__location",
+        queryset=Location.objects.all(),
+        to_field_name="name",
+        label="Location(s) and descendants thereof (name or ID)",
+    )
     device = NaturalKeyOrPKMultipleChoiceFilter(
         queryset=Device.objects.all(),
         to_field_name="name",

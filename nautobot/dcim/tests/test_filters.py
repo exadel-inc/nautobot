@@ -941,6 +941,19 @@ class DeviceComponentTestMixin:
     def setUpTestData(cls):
         common_test_data(cls)
 
+    def test_location_subtree(self):
+        """The location_subtree filter includes descendant locations while location matches only the exact one."""
+        self.loc2.location_type.content_types.add(ContentType.objects.get_for_model(Device))
+        component = self.queryset.first()
+        Device.objects.filter(pk=component.device.pk).update(location=self.loc2)
+        expected = self.queryset.filter(device__location__in=[self.loc1, self.loc2])
+        for value in (self.loc1.name, str(self.loc1.pk)):
+            with self.subTest(value=value):
+                self.assertQuerysetEqualAndNotEmpty(
+                    self.filterset({"location_subtree": [value]}, self.queryset).qs, expected, ordered=False
+                )
+        self.assertNotIn(component, self.filterset({"location": [self.loc1.name]}, self.queryset).qs)
+
 
 class ModularDeviceComponentTestMixin(DeviceComponentTestMixin):
     generic_filter_tests = [
@@ -3364,6 +3377,22 @@ class VirtualChassisTestCase(FilterTestCases.FilterTestCase):
         Device.objects.filter(pk=devices[3].pk).update(virtual_chassis=virtual_chassis[1])
         Device.objects.filter(pk=devices[5].pk).update(virtual_chassis=virtual_chassis[2])
 
+    def test_location_subtree(self):
+        campus = self.locations[0]
+        building = Location.objects.filter(location_type=LocationType.objects.get(name="Building")).first()
+        building.location_type.content_types.add(ContentType.objects.get_for_model(Device))
+        building.parent = campus
+        building.validated_save()
+        virtual_chassis = VirtualChassis.objects.get(name="VC 3")
+        Device.objects.filter(pk=virtual_chassis.master.pk).update(location=building)
+        expected = VirtualChassis.objects.filter(master__location__in=campus.descendants(include_self=True))
+        for value in (campus.name, str(campus.pk)):
+            with self.subTest(value=value):
+                self.assertQuerysetEqualAndNotEmpty(
+                    self.filterset({"location_subtree": [value]}, self.queryset).qs, expected, ordered=False
+                )
+        self.assertNotIn(virtual_chassis, self.filterset({"location": [campus.name]}, self.queryset).qs)
+
 
 class CableTypeTestCase(FilterTestCases.FilterTestCase):
     queryset = CableType.objects.all()
@@ -4886,6 +4915,18 @@ class _ConnectionFilterSetTestMixin:
             name=name, device_type=device_type, role=device_role, location=location, status=device_status
         )
 
+    @classmethod
+    def _move_device_to_child_location(cls, device):
+        """Move `device` into a child of the location `_make_device` uses, and return (parent, child)."""
+        parent = Location.objects.filter(location_type=LocationType.objects.get(name="Campus")).first()
+        building_type = LocationType.objects.get(name="Building")
+        building_type.content_types.add(ContentType.objects.get_for_model(Device))
+        child = Location.objects.filter(location_type=building_type).first()
+        child.parent = parent
+        child.validated_save()
+        Device.objects.filter(pk=device.pk).update(location=child)
+        return parent, child
+
 
 class ConsoleConnectionFilterSetTestCase(_ConnectionFilterSetTestMixin, FilterTestCases.FilterTestCase):
     """Exercise ConsoleConnectionFilterSet (search + device/location filters)."""
@@ -4922,6 +4963,16 @@ class ConsoleConnectionFilterSetTestCase(_ConnectionFilterSetTestMixin, FilterTe
         # `test_no_distinct_on_empty_filter_params` check meaningful.
         cls.queryset = ConsolePort.objects.filter(cable_paths__isnull=False)
 
+    def test_location_subtree(self):
+        parent, child = self._move_device_to_child_location(self.device_a)
+        expected = self.queryset.filter(device__location__in=[parent, child])
+        for value in (parent.name, str(parent.pk)):
+            with self.subTest(value=value):
+                self.assertQuerysetEqualAndNotEmpty(
+                    self.filterset({"location_subtree": [value]}, self.queryset).qs, expected, ordered=False
+                )
+        self.assertNotIn(self.cp_a, self.filterset({"location": parent.name}, self.queryset).qs)
+
 
 class PowerConnectionFilterSetTestCase(_ConnectionFilterSetTestMixin, FilterTestCases.FilterTestCase):
     """Exercise PowerConnectionFilterSet (search + device/location filters)."""
@@ -4954,6 +5005,16 @@ class PowerConnectionFilterSetTestCase(_ConnectionFilterSetTestMixin, FilterTest
             status=cable_status,
         )
         cls.queryset = PowerPort.objects.filter(cable_paths__isnull=False)
+
+    def test_location_subtree(self):
+        parent, child = self._move_device_to_child_location(self.device_a)
+        expected = self.queryset.filter(device__location__in=[parent, child])
+        for value in (parent.name, str(parent.pk)):
+            with self.subTest(value=value):
+                self.assertQuerysetEqualAndNotEmpty(
+                    self.filterset({"location_subtree": [value]}, self.queryset).qs, expected, ordered=False
+                )
+        self.assertNotIn(self.pp_a, self.filterset({"location": parent.name}, self.queryset).qs)
 
 
 class InterfaceConnectionFilterSetTestCase(_ConnectionFilterSetTestMixin, FilterTestCases.FilterTestCase):
@@ -5037,3 +5098,20 @@ class InterfaceConnectionFilterSetTestCase(_ConnectionFilterSetTestMixin, Filter
         unfiltered_count = self.queryset.count()
         result = self.filterset({"location": "   "}, self.queryset).qs
         self.assertEqual(result.count(), unfiltered_count)
+
+    def test_location_subtree_matches_either_endpoint(self):
+        parent, child = self._move_device_to_child_location(self.device_alpha)
+        alpha_interfaces = self.device_alpha.interfaces.values("pk")
+        expected = self.queryset.filter(Q(origin_id__in=alpha_interfaces) | Q(destination_id__in=alpha_interfaces))
+        for value in (child.name, str(child.pk)):
+            with self.subTest(value=value):
+                self.assertQuerysetEqualAndNotEmpty(
+                    self.filterset({"location_subtree": [value]}, self.queryset).qs, expected, ordered=False
+                )
+        self.assertQuerysetEqualAndNotEmpty(
+            self.filterset({"location_subtree": [parent.name]}, self.queryset).qs, self.queryset, ordered=False
+        )
+
+    def test_location_subtree_empty_input_returns_unfiltered_queryset(self):
+        result = self.filterset({"location_subtree": []}, self.queryset).qs
+        self.assertEqual(result.count(), self.queryset.count())
