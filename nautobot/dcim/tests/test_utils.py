@@ -318,6 +318,33 @@ class GetCablePkTestCase(TestCase):
 
         self.assertEqual(get_cable_pk(self.spine_interface_child), self.spine_interface.cable.pk)
 
+    def test_get_cable_pk_breakout_child_uncabled_lane_returns_empty_string(self):
+        status_active = Status.objects.get_for_model(Interface).get(name="Active")
+        status_connected = Status.objects.get_for_model(Cable).get(name="Connected")
+        device = self.spine_interface.device
+        parent = Interface.objects.create(device=device, name="Half Cabled 1", status=status_active)
+        far_interface = Interface.objects.create(device=device, name="Half Cabled Far 1", status=status_active)
+        children = [
+            Interface.objects.create(
+                device=device,
+                name=f"Half Cabled 1/{position}",
+                type=InterfaceTypeChoices.TYPE_VIRTUAL,
+                status=status_active,
+                parent_interface=parent,
+                breakout_position=position,
+            )
+            for position in (1, 2)
+        ]
+        Cable(
+            termination_a=parent,
+            termination_b=far_interface,
+            cable_type=CableType.objects.get(name="1x2 Breakout Cable"),
+            status=status_connected,
+        ).save()
+
+        self.assertEqual(get_cable_pk(children[0]), parent.cable.pk)
+        self.assertEqual(get_cable_pk(children[1]), "")
+
     def test_get_cable_pk_directly_cabled_interface_returns_own_cable_pk(self):
         self.assertEqual(get_cable_pk(self.spine_interface), self.breakout_cable.pk)
 
