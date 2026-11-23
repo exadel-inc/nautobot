@@ -2496,6 +2496,32 @@ class TestIPAddress(ModelTestCases.BaseModelTestCase):
         ip.validated_save()
         self.assertTrue(IPAddress.objects.filter(host="10.0.0.75").exists())
 
+    def test_dns_name_valid(self):
+        valid_names = ["host", "host-1.example.com", "example_1", "xn--bcher-kva.example", "host.example.com."]
+        for index, dns_name in enumerate(valid_names, start=1):
+            with self.subTest(dns_name=dns_name):
+                ip = IPAddress(
+                    address=f"192.0.2.{index}/24", dns_name=dns_name, status=self.status, namespace=self.namespace
+                )
+                ip.validated_save()
+
+    def test_dns_name_invalid(self):
+        invalid_names = [
+            "whatever-.your.tld",
+            "-host.example.com",
+            "host.-example.com",
+            "host..example.com",
+            ".example.com",
+        ]
+        for index, dns_name in enumerate(invalid_names, start=1):
+            with self.subTest(dns_name=dns_name):
+                ip = IPAddress(
+                    address=f"192.0.2.{index}/24", dns_name=dns_name, status=self.status, namespace=self.namespace
+                )
+                with self.assertRaises(ValidationError) as cm:
+                    ip.validated_save()
+                self.assertIn("dns_name", cm.exception.message_dict)
+
 
 class TestIPAddressRange(ModelTestCases.BaseModelTestCase):
     model = IPAddressRange
