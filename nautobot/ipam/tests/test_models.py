@@ -2521,6 +2521,9 @@ class TestIPAddress(ModelTestCases.BaseModelTestCase):
                 with self.assertRaises(ValidationError) as cm:
                     ip.validated_save()
                 self.assertIn("dns_name", cm.exception.message_dict)
+                self.assertIn(
+                    "must not be empty or start or end with a hyphen", cm.exception.message_dict["dns_name"][0]
+                )
 
 
 class TestIPAddressRange(ModelTestCases.BaseModelTestCase):
