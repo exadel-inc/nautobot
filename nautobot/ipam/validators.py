@@ -24,7 +24,10 @@ class MinPrefixLengthValidator(BaseValidator):
 
 
 DNSValidator = RegexValidator(
-    regex="^[0-9A-Za-z._-]+$",
-    message="Only alphanumeric characters, hyphens, periods, and underscores are allowed in DNS names",
+    regex=r"^[0-9A-Za-z_]([0-9A-Za-z_-]*[0-9A-Za-z_])?(\.[0-9A-Za-z_]([0-9A-Za-z_-]*[0-9A-Za-z_])?)*\.?$",
+    message=(
+        "Only alphanumeric characters, hyphens, periods, and underscores are allowed in DNS names, "
+        "and each part between periods must not be empty or start or end with a hyphen"
+    ),
     code="invalid",
 )
