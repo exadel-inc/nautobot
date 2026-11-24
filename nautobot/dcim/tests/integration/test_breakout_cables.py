@@ -177,6 +177,41 @@ class BreakoutCablesTestCase(SeleniumTestCase):
                 f"{interface.name} row is still green after toggling the cable",
             )
 
+    def test_list_interfaces_view_unoccupied_lane_child_color_unchanged_when_cable_toggled(self):
+        _, _, spine_interface, spine_interface_children, _, leaf_interfaces = self.create_1x2_breakout_cable()
+        # Free lane 2 by removing its far termination from the breakout cable.
+        leaf_interfaces[1].cable_termination.delete()
+        occupied_child, unoccupied_child = spine_interface_children
+
+        self.browser.visit(self.live_server_url + reverse("dcim:interface_list"))
+
+        unoccupied_row = f'tr:has(input[name="pk"][value="{unoccupied_child.pk}"])'
+        self.assertTrue(
+            self.browser.is_element_present_by_css(unoccupied_row, wait_time=10),
+            "Unoccupied-lane child row was not rendered",
+        )
+        self.assertFalse(self.browser.is_element_present_by_css(f"{unoccupied_row}.table-success", wait_time=1))
+
+        toggle = WebDriverWait(self.browser.driver, 10).until(
+            expected_conditions.presence_of_element_located(
+                (By.CSS_SELECTOR, f'tr:has(input[name="pk"][value="{spine_interface.pk}"]) a.cable-toggle')
+            )
+        )
+        self.browser.driver.execute_script("arguments[0].click();", toggle)
+
+        for interface in (spine_interface, occupied_child, leaf_interfaces[0]):
+            self.assertTrue(
+                self.browser.is_element_present_by_css(
+                    f'tr:has(input[name="pk"][value="{interface.pk}"]).table-info', wait_time=10
+                ),
+                f"{interface.name} row did not turn blue after toggling the cable",
+            )
+        self.assertFalse(
+            self.browser.is_element_present_by_css(f"{unoccupied_row}.table-info", wait_time=1),
+            "Unoccupied-lane child row incorrectly turned blue after toggling the cable",
+        )
+        self.assertFalse(self.browser.is_element_present_by_css(f"{unoccupied_row}.table-success", wait_time=1))
+
     def test_list_interfaces_view_unrelated_interface_color_unchanged_when_cable_toggled(self):
         _, spine_device, spine_interface, _, _, _ = self.create_1x2_breakout_cable()
 
