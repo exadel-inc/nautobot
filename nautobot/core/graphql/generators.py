@@ -2,7 +2,9 @@
 
 import logging
 
+from django.contrib.contenttypes.prefetch import GenericPrefetch
 from django.core.exceptions import ObjectDoesNotExist
+from django.db.models import Prefetch
 import graphene
 import graphene_django_optimizer as gql_optimizer
 from graphql import GraphQLError
@@ -248,9 +250,36 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
         peer_model (Model): Django Model of the peer of this relationship
     """
 
+    peer_side = RelationshipSideChoices.OPPOSITE[side]
+    prefetched_attr = f"_graphql_{name}_{side}_associations"
+
+    def prefetch_associations(info, *args):
+        """Load the associations of this relationship, with their permitted peers, for the whole list at once."""
+        peer_queryset = peer_model.objects.all()
+        if hasattr(peer_queryset, "restrict"):
+            peer_queryset = peer_queryset.restrict(info.context.user, "view")
+        peer_path = f"{peer_side}_{peer_model._meta.app_label}_{peer_model._meta.model_name}"
+        ordering = [
+            f"-{peer_path}__{field[1:]}" if field.startswith("-") else f"{peer_path}__{field}"
+            for field in peer_model._meta.ordering
+            if isinstance(field, str) and field != "?"
+        ]
+        return Prefetch(
+            f"{side}_for_associations",
+            queryset=RelationshipAssociation.objects.filter(relationship=relationship)
+            .order_by(*ordering)
+            .prefetch_related(GenericPrefetch(peer_side, [gql_optimizer.query(peer_queryset, info)])),
+            to_attr=prefetched_attr,
+        )
+
     def resolve_relationship(self, info, **kwargs):
         """Return a queryset or an object depending on the type of the relationship."""
-        peer_side = RelationshipSideChoices.OPPOSITE[side]
+        if hasattr(self, prefetched_attr):
+            peers = [peer for peer in (getattr(a, peer_side) for a in getattr(self, prefetched_attr)) if peer]
+            if relationship.has_many(peer_side):
+                return peers
+            return peers[0] if peers else None
+
         query_params = {"relationship": relationship}
         # https://github.com/nautobot/nautobot/issues/1228
         # If querying for **only** the ID of the related object, for example:
@@ -323,6 +352,10 @@ def generate_relationship_resolver(name, resolver_name, relationship, side, peer
             return peer_queryset.first()
 
     resolve_relationship.__name__ = resolver_name
+    if not relationship.symmetric:
+        resolve_relationship = gql_optimizer.resolver_hints(prefetch_related=prefetch_associations)(
+            resolve_relationship
+        )
     return mark_permission_enforced(resolve_relationship)
 
 

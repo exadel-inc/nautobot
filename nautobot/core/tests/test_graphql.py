@@ -11,9 +11,11 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
+from django.db import connection
 from django.db.models import Count, Q
 from django.test import override_settings, tag
 from django.test.client import RequestFactory
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 import graphene.types
 from graphene_django.registry import get_global_registry
@@ -485,6 +487,41 @@ class GraphQLRelatedObjectPermissionTest(GraphQLTestCaseBase):
         self.assertEqual(len(result.data["locations"]), 1)
         vlan_names = sorted(vlan["name"] for vlan in result.data["locations"][0][self.rel_field_name])
         self.assertEqual(vlan_names, ["Visible VLAN"])
+
+    def test_relationship_traversal_to_one_enforces_remote_model_permissions(self):
+        """A to-one Relationship field is null when the user may not view the peer."""
+        visible_tenant = Tenant.objects.create(name="Visible Tenant")
+        hidden_tenant = Tenant.objects.create(name="Hidden Tenant")
+        relationship = Relationship.objects.create(
+            label="Perm Tenant to VLANs",
+            key="perm_tenant_to_vlans",
+            source_type=ContentType.objects.get_for_model(Tenant),
+            destination_type=ContentType.objects.get_for_model(VLAN),
+            type="one-to-many",
+        )
+        RelationshipAssociation.objects.create(
+            relationship=relationship, source=visible_tenant, destination=self.visible_vlan
+        )
+        RelationshipAssociation.objects.create(
+            relationship=relationship, source=hidden_tenant, destination=self.hidden_vlan
+        )
+        self._grant_view(self.user, VLAN)
+        self._grant_view(self.user, Tenant, {"name": "Visible Tenant"})
+
+        query = """
+        query {
+            vlans(name: ["Visible VLAN", "Hidden VLAN"]) {
+                name
+                rel_perm_tenant_to_vlans {
+                    name
+                }
+            }
+        }
+        """
+        result = execute_query_on_rebuilt_schema(query, user=self.user)
+        self.assertIsNone(result.errors)
+        tenants_by_vlan = {vlan["name"]: vlan["rel_perm_tenant_to_vlans"] for vlan in result.data["vlans"]}
+        self.assertEqual(tenants_by_vlan, {"Visible VLAN": {"name": "Visible Tenant"}, "Hidden VLAN": None})
 
     def test_fk_traversal_enforces_related_model_permissions(self):
         """Forward FK traversal must respect view permissions on the related model."""
@@ -1668,6 +1705,25 @@ class GraphQLQueryTest(GraphQLTestCaseBase):
             destination=cls.device1,
         )
         cls.rm2ms_assoc_3.validated_save()
+
+        vlan_status = Status.objects.get_for_model(VLAN)[0]
+        cls.relationship_list_vlans = [
+            VLAN.objects.create(name=f"Rel VLAN {i}", vid=3502 - i, status=vlan_status) for i in range(3)
+        ]
+        cls.relationship_device_vlans = Relationship.objects.create(
+            label="Rel Devices to VLANs",
+            key="rel_devices_to_vlans",
+            source_type=ContentType.objects.get_for_model(Device),
+            destination_type=ContentType.objects.get_for_model(VLAN),
+            type="many-to-many",
+        )
+        cls.relationship_tenant_devices = Relationship.objects.create(
+            label="Rel Tenant to Devices",
+            key="rel_tenant_to_devices",
+            source_type=ContentType.objects.get_for_model(Tenant),
+            destination_type=ContentType.objects.get_for_model(Device),
+            type="one-to-many",
+        )
 
     def execute_query(self, query, variables=None):
         document = parse(query)
@@ -3061,6 +3117,110 @@ query {
             expected = set(device_obj.interfaces.filter(role=interface_role).values_list("name", flat=True))
             actual = {iface["name"] for iface in device_data["interfaces"]}
             self.assertEqual(actual, expected, f"Mismatch for device {device_data['name']}")
+
+    def _create_relationship_list_devices(self, device_count):
+        """Create devices that each have three VLAN peers and `tenant1` as their tenant peer."""
+        devices = []
+        for _ in range(device_count):
+            device = Device.objects.create(
+                name=f"Rel Device {Device.objects.count()}",
+                device_type=self.device_type1,
+                role=self.device_role1,
+                location=self.location1,
+                status=self.device_statuses[0],
+            )
+            for vlan in self.relationship_list_vlans:
+                RelationshipAssociation.objects.create(
+                    relationship=self.relationship_device_vlans, source=device, destination=vlan
+                )
+            RelationshipAssociation.objects.create(
+                relationship=self.relationship_tenant_devices, source=self.tenant1, destination=device
+            )
+            devices.append(device)
+        return devices
+
+    def _execute_on_schema(self, schema, query):
+        return execute(schema=schema.graphql_schema, document=parse(query), context_value=self.request)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_relationship_list_no_n_plus_one(self):
+        """The association and peer queries of non-symmetric relationships run once per list, not per object."""
+        self._create_relationship_list_devices(4)
+        query = "query { devices { name rel_rel_devices_to_vlans { name } rel_rel_tenant_to_devices { name } } }"
+        schema = rebuild_graphql_schema()
+        result = self._execute_on_schema(schema, query)
+        self.assertIsNone(result.errors)
+        with AssertNoRepeatedQueries(self, threshold=3):
+            result = self._execute_on_schema(schema, query)
+        self.assertIsNone(result.errors)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_relationship_list_query_count_independent_of_object_count(self):
+        """The query count of a list with relationship fields is the same for 3 and 6 devices."""
+        query = "query { devices { name rel_rel_devices_to_vlans { name } rel_rel_tenant_to_devices { name } } }"
+        self._create_relationship_list_devices(3)
+        schema = rebuild_graphql_schema()
+        self.assertIsNone(self._execute_on_schema(schema, query).errors)
+        with CaptureQueriesContext(connection) as small:
+            self._execute_on_schema(schema, query)
+        self._create_relationship_list_devices(3)
+        with CaptureQueriesContext(connection) as large:
+            result = self._execute_on_schema(schema, query)
+        self.assertIsNone(result.errors)
+        self.assertEqual(len(small), len(large))
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_relationship_list_results(self):
+        """Each device gets its own peers in default order, and a to-one side gets one object or null."""
+        devices = self._create_relationship_list_devices(2)
+        query = "query { devices { name rel_rel_devices_to_vlans { id } rel_rel_tenant_to_devices { id } } }"
+        result = execute_query_on_rebuilt_schema(query, request=self.request)
+        self.assertIsNone(result.errors)
+        by_name = {item["name"]: item for item in result.data["devices"]}
+        expected_vlans = [
+            str(pk) for pk in VLAN.objects.filter(name__startswith="Rel VLAN").values_list("pk", flat=True)
+        ]
+        for device in devices:
+            self.assertEqual([v["id"] for v in by_name[device.name]["rel_rel_devices_to_vlans"]], expected_vlans)
+            self.assertEqual(by_name[device.name]["rel_rel_tenant_to_devices"], {"id": str(self.tenant1.id)})
+        self.assertIsNone(by_name[self.device2.name]["rel_rel_tenant_to_devices"])
+        self.assertEqual(by_name[self.device2.name]["rel_rel_devices_to_vlans"], [])
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    def test_query_relationship_list_results_non_symmetric_self_relationship(self):
+        """Both sides of a non-symmetric self-relationship return their own peers in one list query."""
+        relationship = Relationship.objects.create(
+            label="Rel Device Parent",
+            key="rel_device_parent",
+            source_type=ContentType.objects.get_for_model(Device),
+            destination_type=ContentType.objects.get_for_model(Device),
+            type="many-to-many",
+        )
+        for source, destination in ((self.device1, self.device2), (self.device1, self.device3)):
+            RelationshipAssociation.objects.create(relationship=relationship, source=source, destination=destination)
+        query = """
+        query {
+            devices(name: ["Device 1", "Device 2", "Device 3"]) {
+                name
+                rel_rel_device_parent_source { name }
+                rel_rel_device_parent_destination { name }
+            }
+        }
+        """
+        result = execute_query_on_rebuilt_schema(query, request=self.request)
+        self.assertIsNone(result.errors)
+        by_name = {item["name"]: item for item in result.data["devices"]}
+        self.assertEqual(
+            {name: sorted(d["name"] for d in item["rel_rel_device_parent_source"]) for name, item in by_name.items()},
+            {"Device 1": [], "Device 2": ["Device 1"], "Device 3": ["Device 1"]},
+        )
+        self.assertEqual(
+            {
+                name: sorted(d["name"] for d in item["rel_rel_device_parent_destination"])
+                for name, item in by_name.items()
+            },
+            {"Device 1": ["Device 2", "Device 3"], "Device 2": [], "Device 3": []},
+        )
 
 
 class GraphQLTypeTestCase(UnitTestTestCase):
