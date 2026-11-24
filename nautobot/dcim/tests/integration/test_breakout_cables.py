@@ -23,7 +23,7 @@ class BreakoutCablesTestCase(SeleniumTestCase):
         self.logout()
         super().tearDown()
 
-    def create_1x2_breakout_cable(self):
+    def create_1x2_breakout_cable(self, cable_second_lane=True):
         spine_device = create_test_device("Breakout Cable Spine Device")
         leaf_device = create_test_device("Breakout Cable Leaf Device")
 
@@ -53,7 +53,8 @@ class BreakoutCablesTestCase(SeleniumTestCase):
             status=status_connected,
         )
         cable.save()
-        cable.add_termination(leaf_interfaces[1], "B", connector=2)
+        if cable_second_lane:
+            cable.add_termination(leaf_interfaces[1], "B", connector=2)
 
         spine_interface_children = [
             Interface.objects.create(
@@ -112,6 +113,42 @@ class BreakoutCablesTestCase(SeleniumTestCase):
             self.assertFalse(
                 self.browser.is_element_present_by_css(f'tr[data-name="{child.name}"].table-success', wait_time=1),
                 f"{child.name} row is still green after toggling the parent cable",
+            )
+
+    def test_device_detail_view_interface_tab_uncabled_breakout_child_color_unchanged_when_cable_toggled(self):
+        _, spine_device, spine_interface, spine_interface_children, _, _ = self.create_1x2_breakout_cable(
+            cable_second_lane=False
+        )
+        cabled_child, uncabled_child = spine_interface_children
+
+        self.browser.visit(self.live_server_url + reverse("dcim:device_interfaces", kwargs={"pk": spine_device.pk}))
+
+        self.assertTrue(
+            self.browser.is_element_present_by_css(f'tr[data-name="{cabled_child.name}"].table-success', wait_time=10),
+            "Cabled child row did not start green",
+        )
+        self.assertFalse(
+            self.browser.is_element_present_by_css(f'tr[data-name="{uncabled_child.name}"].table-success', wait_time=1),
+            "Uncabled child row started green",
+        )
+
+        toggle = WebDriverWait(self.browser.driver, 10).until(
+            expected_conditions.presence_of_element_located(
+                (By.CSS_SELECTOR, f'tr[data-name="{spine_interface.name}"] a.cable-toggle')
+            )
+        )
+        self.browser.driver.execute_script("arguments[0].click();", toggle)
+
+        self.assertTrue(
+            self.browser.is_element_present_by_css(f'tr[data-name="{cabled_child.name}"].table-info', wait_time=10),
+            "Cabled child row did not turn blue after toggling the parent cable",
+        )
+        for color_class in ("table-success", "table-info", "table-warning"):
+            self.assertFalse(
+                self.browser.is_element_present_by_css(
+                    f'tr[data-name="{uncabled_child.name}"].{color_class}', wait_time=1
+                ),
+                f"Uncabled child row got {color_class} after toggling the parent cable",
             )
 
     def test_device_detail_view_interface_tab_icons_change_after_cable_toggled_from_connected_to_planned(self):
