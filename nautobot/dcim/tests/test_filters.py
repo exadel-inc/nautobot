@@ -6,7 +6,8 @@ from django.contrib.contenttypes.models import ContentType
 from django.db.models import F, Q
 
 from nautobot.circuits.models import Circuit, CircuitTermination, CircuitType, Provider
-from nautobot.core.testing import FilterTestCases
+from nautobot.core.graphql import execute_query
+from nautobot.core.testing import FilterTestCases, TestCase
 from nautobot.dcim.choices import (
     CableLengthUnitChoices,
     CableTypeChoices,
@@ -5033,7 +5034,190 @@ class InterfaceConnectionFilterSetTestCase(_ConnectionFilterSetTestMixin, Filter
         result = self.filterset({"q": "   "}, self.queryset).qs
         self.assertEqual(result.count(), unfiltered_count)
 
-    def test_location_whitespace_only_input_returns_unfiltered_queryset(self):
-        unfiltered_count = self.queryset.count()
-        result = self.filterset({"location": "   "}, self.queryset).qs
-        self.assertEqual(result.count(), unfiltered_count)
+
+class DeviceLocationHierarchyFilterTestCase(TestCase):
+    """The `location` filters of device-related filtersets also match devices in descendant locations."""
+
+    @classmethod
+    def setUpTestData(cls):
+        location_type = LocationType.objects.create(name="Hierarchy Test Type", nestable=True)
+        location_type.content_types.add(ContentType.objects.get_for_model(Device))
+        location_status = Status.objects.get_for_model(Location).first()
+        cls.parent = Location.objects.create(name="Hier Parent", location_type=location_type, status=location_status)
+        cls.child = Location.objects.create(
+            name="Hier Child", location_type=location_type, parent=cls.parent, status=location_status
+        )
+        cls.other = Location.objects.create(name="Hier Other", location_type=location_type, status=location_status)
+
+        manufacturer = Manufacturer.objects.create(name="Hierarchy Test Manufacturer")
+        device_type = DeviceType.objects.create(manufacturer=manufacturer, model="Hierarchy Test Device Type")
+        role = Role.objects.create(name="Hierarchy Test Role")
+        role.content_types.add(ContentType.objects.get_for_model(Device))
+        device_status = Status.objects.get_for_model(Device).first()
+        iface_status = Status.objects.get_for_model(Interface).first()
+        cable_status = Status.objects.get_for_model(Cable).get(name="Connected")
+
+        def make_device(name, location):
+            return Device.objects.create(
+                name=name, device_type=device_type, role=role, location=location, status=device_status
+            )
+
+        cls.child_device = make_device("Hier Child Device", cls.child)
+        cls.other_device = make_device("Hier Other Device", cls.other)
+
+        cls.inventory_item = InventoryItem.objects.create(device=cls.child_device, name="Hier Item")
+        InventoryItem.objects.create(device=cls.other_device, name="Hier Other Item")
+        cls.virtual_chassis = VirtualChassis.objects.create(name="Hier VC", master=cls.child_device)
+        cls.child_device.virtual_chassis = cls.virtual_chassis
+        cls.child_device.vc_position = 1
+        cls.child_device.validated_save()
+        cls.other_vc = VirtualChassis.objects.create(name="Hier Other VC", master=cls.other_device)
+        cls.other_device.virtual_chassis = cls.other_vc
+        cls.other_device.vc_position = 1
+        cls.other_device.validated_save()
+
+        cls.interface = Interface.objects.create(
+            device=cls.child_device, name="Hier Eth", status=iface_status, type="1000base-t"
+        )
+        other_iface = Interface.objects.create(
+            device=cls.other_device, name="Hier Other Eth", status=iface_status, type="1000base-t"
+        )
+        console_port = ConsolePort.objects.create(device=cls.child_device, name="Hier CP")
+        other_console_port = ConsolePort.objects.create(device=cls.other_device, name="Hier Other CP")
+        power_port = PowerPort.objects.create(device=cls.child_device, name="Hier PP")
+        other_power_port = PowerPort.objects.create(device=cls.other_device, name="Hier Other PP")
+        # Connect the child and other devices to each other so both locations appear on each connection.
+        Cable.objects.create(
+            termination_a=console_port,
+            termination_b=ConsoleServerPort.objects.create(device=cls.other_device, name="Hier CSP"),
+            status=cable_status,
+        )
+        Cable.objects.create(
+            termination_a=other_console_port,
+            termination_b=ConsoleServerPort.objects.create(device=cls.other_device, name="Hier CSP 2"),
+            status=cable_status,
+        )
+        Cable.objects.create(
+            termination_a=power_port,
+            termination_b=PowerOutlet.objects.create(device=cls.other_device, name="Hier PO"),
+            status=cable_status,
+        )
+        Cable.objects.create(
+            termination_a=other_power_port,
+            termination_b=PowerOutlet.objects.create(device=cls.other_device, name="Hier PO 2"),
+            status=cable_status,
+        )
+        Cable.objects.create(termination_a=cls.interface, termination_b=other_iface, status=cable_status)
+        # A connection entirely within the unrelated location.
+        other_iface_2 = Interface.objects.create(
+            device=cls.other_device, name="Hier Other Eth 2", status=iface_status, type="1000base-t"
+        )
+        other_iface_3 = Interface.objects.create(
+            device=cls.other_device, name="Hier Other Eth 3", status=iface_status, type="1000base-t"
+        )
+        Cable.objects.create(termination_a=other_iface_2, termination_b=other_iface_3, status=cable_status)
+
+        iface_ct = ContentType.objects.get_for_model(Interface)
+        cls.cases = {
+            "inventory item": (
+                InventoryItemFilterSet,
+                InventoryItem.objects.filter(device__name__startswith="Hier"),
+                lambda obj: obj.device.location,
+            ),
+            "interface": (
+                InterfaceFilterSet,
+                Interface.objects.filter(device__name__startswith="Hier"),
+                lambda obj: obj.device.location,
+            ),
+            "virtual chassis": (
+                VirtualChassisFilterSet,
+                VirtualChassis.objects.filter(name__startswith="Hier"),
+                lambda obj: obj.master.location,
+            ),
+            "console connection": (
+                ConsoleConnectionFilterSet,
+                ConsolePort.objects.filter(cable_paths__isnull=False, device__name__startswith="Hier"),
+                lambda obj: obj.device.location,
+            ),
+            "power connection": (
+                PowerConnectionFilterSet,
+                PowerPort.objects.filter(cable_paths__isnull=False, device__name__startswith="Hier"),
+                lambda obj: obj.device.location,
+            ),
+            "interface connection": (
+                InterfaceConnectionFilterSet,
+                CablePath.objects.filter(
+                    origin_type=iface_ct, destination_type=iface_ct, origin_id__lt=F("destination_id")
+                ),
+                lambda obj: {obj.origin.device.location, obj.destination.device.location},
+            ),
+        }
+
+    def _locations(self, getter, obj):
+        value = getter(obj)
+        return value if isinstance(value, set) else {value}
+
+    def _assert_filter(self, name, params, expected_locations):
+        filterset, queryset, getter = self.cases[name]
+        result = filterset(params, queryset).qs.distinct()
+        self.assertTrue(result.exists(), msg=f"{name}: no results for {params}")
+        for obj in result:
+            self.assertTrue(
+                self._locations(getter, obj) & expected_locations,
+                msg=f"{name}: {obj} not in {expected_locations} for {params}",
+            )
+        return result
+
+    def test_parent_location_includes_descendants(self):
+        for name, (filterset, queryset, _) in self.cases.items():
+            for value in (self.parent.name, str(self.parent.pk)):
+                with self.subTest(filterset=name, value=value):
+                    result = self._assert_filter(name, {"location": [value]}, {self.child})
+                    leaf_result = filterset({"location": [self.child.name]}, queryset).qs
+                    self.assertEqual(set(result), set(leaf_result.distinct()))
+
+    def test_leaf_location_excludes_other_locations(self):
+        for name, (filterset, queryset, getter) in self.cases.items():
+            with self.subTest(filterset=name):
+                result = filterset({"location": [self.child.name]}, queryset).qs.distinct()
+                self.assertTrue(result.exists())
+                for obj in result:
+                    self.assertIn(self.child, self._locations(getter, obj))
+                self.assertLess(result.count(), queryset.distinct().count())
+
+    def test_unrelated_location_returns_nothing(self):
+        unrelated = Location.objects.create(
+            name="Hier Unrelated",
+            location_type=self.parent.location_type,
+            status=self.parent.status,
+        )
+        for name, (filterset, queryset, _) in self.cases.items():
+            with self.subTest(filterset=name):
+                self.assertFalse(filterset({"location": [unrelated.name]}, queryset).qs.exists())
+
+    def test_empty_location_returns_unfiltered_queryset(self):
+        for name, (filterset, queryset, _) in self.cases.items():
+            for value in ([], [""], "   "):
+                with self.subTest(filterset=name, value=value):
+                    self.assertEqual(filterset({"location": value}, queryset).qs.count(), queryset.count())
+
+    def test_connection_filtersets_accept_multiple_locations(self):
+        for name in ("console connection", "power connection", "interface connection"):
+            filterset, queryset, _ = self.cases[name]
+            for values in (
+                [self.child.name, self.other.name],
+                [str(self.child.pk), str(self.other.pk)],
+                [self.parent.name, self.other.name],
+            ):
+                with self.subTest(filterset=name, values=values):
+                    result = filterset({"location": values}, queryset).qs.distinct()
+                    self.assertEqual(result.count(), queryset.distinct().count())
+            only_other = filterset({"location": [self.other.name]}, queryset).qs.distinct()
+            self.assertGreater(only_other.count(), 0)
+
+    def test_graphql_inventory_items_location_includes_descendants(self):
+        user = User.objects.create(username="hier-graphql-user", is_active=True, is_superuser=True)
+        query = f'query {{ inventory_items(location: "{self.parent.name}") {{ name }} }}'
+        response = execute_query(query, user=user)
+        self.assertIsNone(response.errors)
+        self.assertEqual([item["name"] for item in response.data["inventory_items"]], [self.inventory_item.name])
