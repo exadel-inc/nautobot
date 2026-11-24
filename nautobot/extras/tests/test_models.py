@@ -1890,6 +1890,22 @@ class GitRepositoryTest(ModelTestCases.BaseModelTestCase):
     def test_filesystem_path(self):
         self.assertEqual(self.repo.filesystem_path, os.path.join(settings.GIT_ROOT, self.repo.slug))
 
+    @mock.patch("nautobot.extras.utils.transaction.on_commit")
+    def test_get_latest_sync_kubernetes_job_queue(self, mock_on_commit):
+        """The sync JobResult of a repository synced via a Kubernetes job queue is found by get_latest_sync()."""
+        job_model = JobModel.objects.get_for_class_path("nautobot.core.jobs.GitRepositorySync")
+        job_model.default_job_queue = JobQueue.objects.create(
+            name="k8s-queue", queue_type=JobQueueTypeChoices.TYPE_KUBERNETES
+        )
+        job_model.default_job_queue_override = True
+        job_model.validated_save()
+        user = get_user_model().objects.create(username="git-sync-user")
+
+        with override_settings(KUBERNETES_JOB_MANIFEST={"spec": {"template": {"spec": {"containers": [{}]}}}}):
+            job_result = self.repo.sync(user=user)
+
+        self.assertEqual(self.repo.get_latest_sync(), job_result)
+
     def test_slug_no_change(self):
         """Confirm that a slug cannot be changed after creation."""
         self.repo.slug = "a_different_slug"
