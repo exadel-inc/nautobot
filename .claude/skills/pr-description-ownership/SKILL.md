@@ -17,8 +17,7 @@ Follow `.github/PULL_REQUEST_TEMPLATE.md` in the clone, with its headings in its
 ```
 # Closes #<issue>
 # What's Changed
-<ONE plain sentence>
-Test status: `<exact command>` -> `<Ran N tests ... OK or FAILED line>`   (or: Not run: <reason>)
+<ONE plain sentence, explaining the process that agent did to achieve the goal, as if it was talking to a colleague what has it done to solve that issue. Use A2/B1 English>
 # Screenshots
 <table, or N/A and the reason>
 # TODO
