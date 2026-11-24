@@ -1374,6 +1374,19 @@ class RunJobManagementCommandTest(TransactionTestCase):
         self.assertIn(f"{job_model.class_path}: SUCCESS", out)
         self.assertEqual("", err)
 
+    @mock.patch("nautobot.extras.management.commands.runjob.call_command")
+    def test_runjob_local_sets_task_name(self, mock_call_command):
+        """The task name is set when the JobResult is created, before `execute_job_result` runs."""
+        _job_class, job_model = get_job_class_and_model("pass_job", "TestPassJob")
+        mock_call_command.side_effect = lambda _command, job_result_pk, **kwargs: models.JobResult.objects.filter(
+            pk=job_result_pk
+        ).update(status=JobResultStatusChoices.STATUS_SUCCESS)
+
+        self.run_command("--local", "--no-color", "--username", self.user.username, job_model.class_path)
+
+        job_result = models.JobResult.objects.filter(job_model=job_model).latest()
+        self.assertEqual(job_result.task_name, job_model.class_path)
+
     def test_runjob_wrong_username(self):
         """A job when run with a nonexistent username, is rejected."""
         module = "modify_db"
@@ -2074,6 +2087,49 @@ class JobResultEnqueueJobCase(TransactionTestCase):
         # when console log is false job_result is not updated before run task
         self.assertEqual(job_result.task_kwargs, {})
         self.assertEqual(job_result.celery_kwargs.get("nautobot_job_console_log"), False)
+
+    @mock.patch("nautobot.extras.models.jobs.run_kubernetes_job_and_return_job_result")
+    def test_kubernetes_queue_sets_task_name(self, mock_kubernetes_job):
+        kubernetes_queue = JobQueue.objects.create(
+            name="Empty Job Queue 1",
+            queue_type=JobQueueTypeChoices.TYPE_KUBERNETES,
+        )
+        mock_kubernetes_job.side_effect = lambda job_result, job_kwargs: job_result
+
+        job_result = JobResult.enqueue_job(
+            job_model=self.job_model,
+            user=self.user,
+            synchronous=False,
+            job_queue=kubernetes_queue,
+            job_kwargs={"foo": "bar"},
+        )
+
+        job_result.refresh_from_db()
+        self.assertEqual(job_result.task_name, self.job_model.class_path)
+
+    @mock.patch("nautobot.extras.utils.transaction.on_commit")
+    @mock.patch(
+        "nautobot.extras.utils.get_kubernetes_job_manifest",
+        return_value={"spec": {"template": {"spec": {"containers": [{}]}}}},
+    )
+    def test_kubernetes_queue_git_sync_found_by_get_latest_sync(self, mock_manifest, mock_on_commit):
+        repository = models.GitRepository.objects.create(
+            name="Test Git Repository",
+            slug="test_git_repository",
+            remote_url="https://example.com/repo.git",
+        )
+        kubernetes_queue = JobQueue.objects.create(
+            name="Empty Job Queue 1",
+            queue_type=JobQueueTypeChoices.TYPE_KUBERNETES,
+        )
+        git_sync_job = Job.objects.get_for_class_path("nautobot.core.jobs.GitRepositorySync")
+        git_sync_job.default_job_queue = kubernetes_queue
+        git_sync_job.default_job_queue_override = True
+        git_sync_job.save()
+
+        job_result = repository.sync(user=self.user)
+
+        self.assertEqual(repository.get_latest_sync(), job_result)
 
     @mock.patch("nautobot.extras.models.jobs.run_kubernetes_job_and_return_job_result")
     @mock.patch("nautobot.extras.jobs.run_console_log_job_and_return_job_result")

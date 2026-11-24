@@ -74,6 +74,7 @@ class Command(BaseCommand):
             job_result = JobResult.objects.create(
                 name=job_model.name,
                 job_model=job_model,
+                task_name=job_model.class_path,
                 user=user,
             )
             schedule = data.get("schedule", None)

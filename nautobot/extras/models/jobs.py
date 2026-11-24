@@ -1114,6 +1114,7 @@ class JobResult(SavedViewMixin, BaseModel, CustomFieldModel):
             job_result = cls.objects.create(
                 name=job_model.name,
                 job_model=job_model,
+                task_name=job_model.class_path,
                 scheduled_job=schedule,
                 user=user,
             )
