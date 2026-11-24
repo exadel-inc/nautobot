@@ -4894,6 +4894,46 @@ class JobResultTestCase(TestCase):
         )
         mock_sync.assert_called_once()
 
+    @mock.patch("nautobot.extras.models.jobs.run_kubernetes_job_and_return_job_result", side_effect=lambda jr, kw: jr)
+    def test_enqueue_job_sets_task_name_kubernetes(self, _mock_k8s):
+        """task_name is populated at enqueue time for Kubernetes queues, which skip the Celery result backend."""
+        _, job_model = get_job_class_and_model("pass_job", "TestPassJob")
+        queue = JobQueue.objects.create(name="k8s-task-name", queue_type=JobQueueTypeChoices.TYPE_KUBERNETES)
+
+        job_result = JobResult.enqueue_job(job_model, self.user, job_queue=queue, job_kwargs={})
+
+        self.assertEqual(job_result.task_name, job_model.class_path)
+
+    @mock.patch("nautobot.extras.jobs.run_job.apply_async")
+    def test_enqueue_job_sets_task_name_celery(self, _mock_apply_async):
+        _, job_model = get_job_class_and_model("pass_job", "TestPassJob")
+
+        job_result = JobResult.enqueue_job(job_model, self.user, job_kwargs={})
+
+        job_result.refresh_from_db()
+        self.assertEqual(job_result.task_name, job_model.class_path)
+
+    @mock.patch("nautobot.extras.jobs.run_job.apply")
+    @mock.patch("nautobot.extras.models.JobResult._sync_eager_result_to_job_result")
+    def test_enqueue_job_sets_task_name_synchronous(self, _mock_sync, _mock_apply):
+        _, job_model = get_job_class_and_model("pass_job", "TestPassJob")
+
+        job_result = JobResult.enqueue_job(job_model, self.user, job_kwargs={}, synchronous=True)
+
+        job_result.refresh_from_db()
+        self.assertEqual(job_result.task_name, job_model.class_path)
+
+    @mock.patch("nautobot.extras.jobs.run_job.apply_async")
+    def test_enqueue_job_sets_task_name_on_existing_job_result(self, _mock_apply_async):
+        _, job_model = get_job_class_and_model("pass_job", "TestPassJob")
+        existing = JobResult.objects.create(name=job_model.name, job_model=job_model, user=self.user)
+        self.assertIsNone(existing.task_name)
+
+        JobResult.enqueue_job(job_model, self.user, job_kwargs={}, job_result=existing)
+
+        existing.refresh_from_db()
+        self.assertEqual(existing.task_name, job_model.class_path)
+
     def test_enqueue_job_raises_when_no_kwargs(self):
         """enqueue_job should raise if job_kwargs=None and no extra_kwargs provided."""
         _, job_model = get_job_class_and_model("pass_job", "TestPassJob")
