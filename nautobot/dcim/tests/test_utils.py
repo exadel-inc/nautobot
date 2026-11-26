@@ -324,3 +324,33 @@ class GetCablePkTestCase(TestCase):
     def test_get_cable_pk_uncabled_interface_returns_empty_string(self):
         self.assertIsNone(self.uncabled_interface.cable)
         self.assertEqual(get_cable_pk(self.uncabled_interface), "")
+
+    def test_get_cable_pk_breakout_child_on_uncabled_lane_returns_empty_string(self):
+        status_active = Status.objects.get_for_model(Interface).get(name="Active")
+        status_connected = Status.objects.get_for_model(Cable).get(name="Connected")
+        spine_device = self.spine_interface.device
+        leaf_device = create_test_device("Breakout Cable Partial Leaf Device")
+
+        partial_trunk = Interface.objects.create(
+            device=spine_device,
+            name="Spine Interface 2",
+            type=InterfaceTypeChoices.TYPE_40GE_QSFP_PLUS,
+            status=status_active,
+        )
+        uncabled_lane_child = Interface.objects.create(
+            device=spine_device,
+            name="Spine Interface 2/2",
+            type=InterfaceTypeChoices.TYPE_VIRTUAL,
+            status=status_active,
+            parent_interface=partial_trunk,
+            breakout_position=2,
+        )
+        Cable(
+            termination_a=partial_trunk,
+            termination_b=Interface.objects.create(device=leaf_device, name="Leaf 1", status=status_active),
+            cable_type=self.breakout_cable.cable_type,
+            status=status_connected,
+        ).save()
+
+        self.assertIsNotNone(partial_trunk.cable)
+        self.assertEqual(get_cable_pk(uncabled_lane_child), "")
