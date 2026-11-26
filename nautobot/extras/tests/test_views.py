@@ -3247,6 +3247,30 @@ class GitRepositoryTestCase(
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.context["result"], {})
 
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=["*"])
+    @mock.patch("nautobot.extras.models.jobs.run_kubernetes_job_and_return_job_result")
+    def test_view_sync_job_result_on_kubernetes_queue(self, mock_kubernetes_job):
+        def store_task_kwargs(job_result, job_kwargs):
+            job_result.task_kwargs = job_kwargs
+            job_result.save()
+            return job_result
+
+        mock_kubernetes_job.side_effect = store_task_kwargs
+        kubernetes_queue = JobQueue.objects.create(
+            name="Kubernetes Queue", queue_type=JobQueueTypeChoices.TYPE_KUBERNETES
+        )
+        job_model = Job.objects.get(job_class_name="GitRepositorySync")
+        job_model.default_job_queue = kubernetes_queue
+        job_model.default_job_queue_override = True
+        job_model.validated_save()
+        instance = self._get_queryset().first()
+
+        job_result = instance.sync(user=self.user)
+
+        response = self.client.get(reverse("extras:gitrepository_result", kwargs={"pk": instance.pk}))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["result"], job_result)
+
     def test_post_sync_repo_anonymous(self):
         self.client.logout()
         url = reverse("extras:gitrepository_sync", kwargs={"pk": self._get_queryset().first().pk})
