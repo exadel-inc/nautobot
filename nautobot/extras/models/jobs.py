@@ -1138,6 +1138,7 @@ class JobResult(SavedViewMixin, BaseModel, CustomFieldModel):
             celery_kwargs=celery_kwargs,
         )
         job_result.celery_kwargs = job_celery_kwargs
+        job_result.task_name = job_model.class_path
         job_result.save()
         job_result.refresh_from_db()
 
