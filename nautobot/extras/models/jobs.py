@@ -1113,6 +1113,7 @@ class JobResult(SavedViewMixin, BaseModel, CustomFieldModel):
         if job_result is None:
             job_result = cls.objects.create(
                 name=job_model.name,
+                task_name=job_model.class_path,
                 job_model=job_model,
                 scheduled_job=schedule,
                 user=user,
