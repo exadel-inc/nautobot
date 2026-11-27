@@ -227,6 +227,42 @@ class BreakoutCablesTestCase(SeleniumTestCase):
             "Unrelated interface row incorrectly turned green after toggling the cable",
         )
 
+    def test_list_interfaces_view_uncabled_breakout_child_color_unchanged_when_cable_toggled(self):
+        cable, _, spine_interface, spine_interface_children, _, _ = self.create_1x2_breakout_cable()
+        cable.terminations.filter(connector=2, cable_end="B").delete()
+        uncabled_child = spine_interface_children[1]
+
+        self.browser.visit(self.live_server_url + reverse("dcim:interface_list"))
+
+        uncabled_row = f'tr:has(input[name="pk"][value="{uncabled_child.pk}"])'
+        self.assertTrue(
+            self.browser.is_element_present_by_css(uncabled_row, wait_time=10),
+            "Uncabled breakout child row was not rendered",
+        )
+        self.assertFalse(
+            self.browser.is_element_present_by_css(f"{uncabled_row}.table-success", wait_time=1),
+            "Uncabled breakout child row should not start green",
+        )
+
+        toggle = WebDriverWait(self.browser.driver, 10).until(
+            expected_conditions.presence_of_element_located(
+                (By.CSS_SELECTOR, f'tr:has(input[name="pk"][value="{spine_interface.pk}"]) a.cable-toggle')
+            )
+        )
+        self.browser.driver.execute_script("arguments[0].click();", toggle)
+
+        for interface in [spine_interface, spine_interface_children[0]]:
+            self.assertTrue(
+                self.browser.is_element_present_by_css(
+                    f'tr:has(input[name="pk"][value="{interface.pk}"]).table-info', wait_time=10
+                ),
+                f"{interface.name} row did not turn blue after toggling the cable",
+            )
+        self.assertFalse(
+            self.browser.is_element_present_by_css(f"{uncabled_row}.table-info", wait_time=1),
+            "Uncabled breakout child row incorrectly turned blue after toggling the cable",
+        )
+
     def test_list_interfaces_view_icons_change_after_cable_toggled_from_connected_to_planned(self):
         _, _, spine_interface, _, _, leaf_interfaces = self.create_1x2_breakout_cable()
 
