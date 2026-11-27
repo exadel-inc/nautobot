@@ -289,6 +289,15 @@ class GetCablePkTestCase(TestCase):
             breakout_position=1,
         )
 
+        cls.spine_interface_child_2 = Interface.objects.create(
+            device=spine_device,
+            name="Spine Interface 1/2",
+            type=InterfaceTypeChoices.TYPE_VIRTUAL,
+            status=status_active,
+            parent_interface=cls.spine_interface,
+            breakout_position=2,
+        )
+
         cls.uncabled_interface = Interface.objects.create(
             device=spine_device, name="eth-uncabled", status=status_active
         )
@@ -317,6 +326,22 @@ class GetCablePkTestCase(TestCase):
         self.assertIsNotNone(self.spine_interface.cable)
 
         self.assertEqual(get_cable_pk(self.spine_interface_child), self.spine_interface.cable.pk)
+
+    def test_get_cable_pk_breakout_child_on_uncabled_lane_returns_empty_string(self):
+        self.breakout_cable.terminations.filter(connector=2, cable_end="B").delete()
+        child = Interface.objects.get(pk=self.spine_interface_child_2.pk)
+
+        self.assertIsNone(child.get_breakout_lane().far_termination)
+        self.assertEqual(get_cable_pk(child), "")
+
+    def test_get_cable_pk_breakout_child_on_uncarried_position_returns_empty_string(self):
+        child = Interface.objects.get(pk=self.spine_interface_child_2.pk)
+        child.breakout_position = 3
+        child.save()
+        child = Interface.objects.get(pk=child.pk)
+
+        self.assertIsNone(child.get_breakout_lane())
+        self.assertEqual(get_cable_pk(child), "")
 
     def test_get_cable_pk_directly_cabled_interface_returns_own_cable_pk(self):
         self.assertEqual(get_cable_pk(self.spine_interface), self.breakout_cable.pk)
